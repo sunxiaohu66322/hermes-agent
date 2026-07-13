@@ -5983,6 +5983,193 @@ _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
 
 
+# ponytail: Windows worker exit-code registry.
+#
+# Problem this solves: ``_default_spawn`` returns ``proc.pid`` and lets the
+# Popen object fall out of scope. CPython's Popen.__del__ then closes the
+# OS process handle, after which Windows reaps the entry from the process
+# table within seconds to minutes. ``detect_crashed_workers`` queries the
+# PID 60s+ later, and ``OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`` by
+# pid returns 0 -- the exit code is gone forever, so every worker death
+# collapses to ("unknown", None) -> "pid N not alive" -> 3 crashes share
+# the same _error_fingerprint -> circuit-breaker auto-blocks the board
+# (see ``_record_task_failure`` failure_limit=1 for systemic fingerprints).
+#
+# Minimal fix that doesn't touch architecture/schema: ``_default_spawn``
+# registers the Popen object with this module-level dict keyed by pid. The
+# Popen object stays alive for as long as the dict holds it; ``poll()``
+# then yields ``returncode`` reliably even minutes after the child exited,
+# because the underlying handle is still open. ``_classify_worker_exit_windows``
+# consults this registry first, only falling back to OpenProcess(pid) when
+# the registry has no entry (e.g. cross-process worker, old dispatcher, or
+# registry trimmed).
+#
+# Cleanup: ``_reap_active_worker_handles`` is called from the periodic
+# callback (next to ``detect_crashed_workers``). It pops entries whose
+# ``poll()`` returned a code (so the OS has the entry, the parent has the
+# code, no further use for the handle) and entries whose _pid_alive() is
+# False AND we already observed their returncode. Bounded by
+# ``_ACTIVE_WORKER_HANDLES_MAX`` as a hard cap against runaway multi-board
+# dispatchers. No thread lock: the dispatcher is single-threaded inside
+# ``run_daemon`` / ``dispatch_once``; the only cross-thread writer would
+# be a test stub spawning concurrently, which the bound cap tolerates.
+_ACTIVE_WORKER_HANDLES_MAX = 512
+_active_worker_handles: "dict[int, tuple[object, float]]" = {}
+
+
+def _register_active_worker(pid: int, proc: object, *, now: "Optional[float]" = None) -> None:
+    """Register a Popen object so its exit code stays queryable later.
+
+    Called from ``_default_spawn`` immediately before returning the pid.
+    Idempotent (latest proc wins for a given pid). ``now`` is injectable
+    for tests; production reads ``time.time()``.
+    """
+    if not pid or pid <= 0:
+        return
+    _t = now if now is not None else time.time()
+    _active_worker_handles[int(pid)] = (proc, _t)
+    if len(_active_worker_handles) > _ACTIVE_WORKER_HANDLES_MAX:
+        # Drop oldest 1/4 by registration time -- cheap, deterministic,
+        # ideal because long-dead workers are the ones poll() will resolve
+        # next tick anyway (their handle removal is then handled in
+        # _reap_active_worker_handles from the read side).
+        ordered = sorted(_active_worker_handles.items(), key=lambda kv: kv[1][1])
+        for _pid, _ in ordered[: len(ordered) // 4]:
+            _active_worker_handles.pop(_pid, None)
+
+
+def _poll_active_worker(pid: int) -> "Optional[int]":
+    """If the registry has a live handle for ``pid`` and that Popen has
+    reported a returncode, return it; otherwise None. Does NOT remove the
+    entry -- ``_reap_active_worker_handles`` is the trim path.
+    """
+    entry = _active_worker_handles.get(int(pid))
+    if entry is None:
+        return None
+    proc, _ts = entry
+    try:
+        rc = proc.poll()
+    except Exception:
+        return None
+    return rc
+
+
+def _reap_active_worker_handles() -> int:
+    """Drop registry entries we no longer need. Returns number dropped.
+
+    Drops:
+    * entries whose poll() returned a real code (worker dead, code read;
+      keeping the handle adds nothing -- a later classify call already
+      captured the code in _recent_worker_exits via the normal reap path
+      -- and OpenProcess is a viable fallback once the entry is gone).
+    * entries older than ``_RECENT_WORKER_EXIT_TTL_SECONDS`` (10min) with
+      no observable exit code -- the child is wedged and the dispatcher's
+      own enforce_max_runtime will SIGKILL it; this just bounds memory.
+
+    Gate the call by walking ALL entries here is O(n) but n is bounded by
+    512, so this is microseconds. Called alongside the per-tick
+    detect_crashed_workers pass in the dispatcher tick.
+    """
+    if not _active_worker_handles:
+        return 0
+    now = time.time()
+    dropped = 0
+    for _pid in list(_active_worker_handles.keys()):
+        entry = _active_worker_handles.get(_pid)
+        if entry is None:
+            continue
+        proc, ts = entry
+        try:
+            rc = proc.poll()
+        except Exception:
+            rc = None
+        if rc is not None:
+            del _active_worker_handles[_pid]
+            dropped += 1
+            continue
+        if now - ts > _RECENT_WORKER_EXIT_TTL_SECONDS:
+            del _active_worker_handles[_pid]
+            dropped += 1
+    return dropped
+
+
+# ponytail: Windows has no os.WEXITSTATUS / WIFEXITED; GetExitCodeProcess
+# returns 259 (STILL_ACTIVE) when the process is technically still alive.
+# detect_crashed_workers only calls us after _pid_alive() is already False,
+# so 259 here means a transient race (the OS hasn't flushed the entry yet)
+# -- fall back to "unknown" to keep prior behavior, no false auto-block.
+_WINDOWS_STILL_ACTIVE = 259
+
+
+def _classify_worker_exit_windows(pid: int) -> "tuple[str, Optional[int]]":
+    """Windows-only probe of a worker's exit status by pid.
+
+    Called when the POSIX reap registry has no entry (which is always on
+    Windows -- see ``_classify_worker_exit``). Two-tier probe:
+
+    1. **Active-handle registry first.** ``_default_spawn`` registered
+       this pid's Popen object so the OS handle stays open and ``proc.poll()``
+       can yield ``returncode`` reliably minutes after the child exited.
+       This is the only path that survives Windows' fast entry cleanup once
+       Popen.__del__ closes the handle.
+    2. **ctypes OpenProcess + GetExitCodeProcess fallback.** Works when
+       the registry has no entry (cross-process worker, restarted
+       dispatcher, time-trimmed entry, or pre-fix old binaries). Falls
+       back to ("unknown", None) when the OS has already retired the pid.
+
+    * ``("clean_exit", 0)`` -- rc 0 (the protocol-violation case upstream).
+    * ``("rate_limited", 75)`` -- provider quota wall sentinel.
+    * ``("nonzero_exit", code)`` -- real error.
+    * ``("unknown", None)`` -- pid already reaped (OpenProcess fails) or
+      STILL_ACTIVE race -- fall back to existing crashed-counter behavior.
+
+    No ``signaled`` return: Windows has no Unix-style signals, and Ctrl-C /
+    TerminateProcess both surface as a nonzero exit code (often 1 / 0xC0000005
+    for access violations). Decoding NTSTATUS is out of scope for the
+    minimal fix; grouping those under ``nonzero_exit`` is correct enough.
+    """
+    try:
+        # Tier 1: active-handle registry. _default_spawn put the Popen
+        # here precisely so we can read returncode seconds-to-minutes
+        # after the child exited, after the OS would have retired the
+        # pid on its own.
+        rc = _poll_active_worker(pid)
+        if rc is not None:
+            if rc == 0:
+                return ("clean_exit", 0)
+            if rc == KANBAN_RATE_LIMIT_EXIT_CODE:
+                return ("rate_limited", rc)
+            return ("nonzero_exit", rc)
+
+        # Tier 2: OpenProcess by pid. Works when someone else still holds
+        # a handle (rare) or when the entry has not yet been retired by
+        # Windows (race-prone: a few hundred ms after child exit).
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, wintypes.DWORD(pid)
+        )
+        if not handle:
+            return ("unknown", None)
+        try:
+            code = wintypes.DWORD(0)
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return ("unknown", None)
+            if code.value == _WINDOWS_STILL_ACTIVE:
+                return ("unknown", None)
+            if code.value == 0:
+                return ("clean_exit", 0)
+            if code.value == KANBAN_RATE_LIMIT_EXIT_CODE:
+                return ("rate_limited", code.value)
+            return ("nonzero_exit", code.value)
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return ("unknown", None)
+
+
 def _record_worker_exit(pid: int, raw_status: int) -> None:
     """Record a reaped child's exit status for later classification.
 
@@ -6032,6 +6219,22 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     """
     entry = _recent_worker_exits.get(int(pid))
     if entry is None:
+        # ponytail: Windows fork of the reap loop never runs (``os.name != 'nt'
+        # guard in reap_worker_zombies), so _recent_worker_exits is always
+        # empty on Windows and every exit falls through to ("unknown", None)
+        # -- which detect_crashed_workers reports as "pid N not alive" and
+        # the unified _error_fingerprint collapses every crash to the same
+        # key, so 3 crashes auto-block the whole board.
+        #
+        # On Windows we cannot os.waitpid() a child whose Popen handle was
+        # abandoned by _default_spawn (subprocess.Popen with no .wait()).
+        # The post-exit process entry still answers OpenProcess briefly,
+        # so probe by pid right now: GetExitCodeProcess gives the real code
+        # (STILL_ACTIVE=259 means the OS hasn't flushed it yet, which the
+        # preceding _pid_alive(False) caller already rules out -- so 259
+        # here means transient race, fall back to "unknown").
+        if os.name == "nt":
+            return _classify_worker_exit_windows(int(pid))
         return ("unknown", None)
     raw, _ = entry
     try:
@@ -6605,9 +6808,20 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     crash_details: list[tuple[str, int, str, bool, str]] = []
     # (task_id, pid, claimer, protocol_violation, error_text)
     with write_txn(conn):
+        # ponytail: JOIN task_runs to read the RUN-level started_at (fresh
+        # per spawn) rather than tasks.started_at (frozen at first claim).
+        # On Windows the 30s crash-grace is short enough that a re-claimed
+        # task whose first claim was >30s ago would be probed during the
+        # new worker's fork/exec window — and _pid_alive can transiently
+        # return False there → false-positive crash. Run-level grace tracks
+        # the actual subprocess we just spawned. Falls back to
+        # tasks.started_at for legacy rows with current_run_id NULL.
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
+            "SELECT t.id, t.worker_pid, t.claim_lock, "
+            "       COALESCE(r.started_at, t.started_at) AS started_at "
+            "FROM tasks t "
+            "LEFT JOIN task_runs r ON r.id = t.current_run_id "
+            "WHERE t.status = 'running' AND t.worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
@@ -6617,7 +6831,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 continue
             # Skip liveness check inside the launch-window grace period
             # so a freshly-spawned worker isn't reclaimed before its PID
-            # is visible on /proc.
+            # is visible on /proc. Grace is measured from the run-level
+            # started_at (the most recent spawn), not the task-level
+            # started_at (the first claim, which may be hours old on a
+            # re-claimed task).
             started_at = row["started_at"] if "started_at" in row.keys() else None
             if started_at is not None:
                 grace = _resolve_crash_grace_seconds()
@@ -7282,6 +7499,12 @@ def _dispatch_once_locked(
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
+    # Windows: drop _active_worker_handles entries whose proc.poll() already
+    # returned (code captured in _recent_worker_exits via the classify call
+    # in detect_crashed_workers below). Kept cheap because callers run a
+    # bounded tick loop; see _reap_active_worker_handles() for the bound.
+    if _IS_WINDOWS:
+        _reap_active_worker_handles()
 
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
@@ -8087,6 +8310,17 @@ def _default_spawn(
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
+    if _IS_WINDOWS:
+        # ponytail: Windows retires a process from the table within seconds
+        # to minutes after the last OS handle is closed, and CPython's
+        # Popen.__del__ closes that handle on GC of the local proc. The
+        # dispatcher queries the pid 60s+ later via detect_crashed_workers,
+        # so without holding the Popen alive the exit code is lost and
+        # every worker death collapses to "pid N not alive". Registering
+        # the Popen lets _classify_worker_exit_windows read returncode
+        # on demand via proc.poll(). Reaped in _reap_active_worker_handles
+        # alongside detect_crashed_workers; bounded by _ACTIVE_WORKER_HANDLES_MAX.
+        _register_active_worker(proc.pid, proc)
     return proc.pid
 
 

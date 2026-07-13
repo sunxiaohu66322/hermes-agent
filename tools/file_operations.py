@@ -27,6 +27,7 @@ Usage:
 
 import os
 import re
+import fnmatch
 import difflib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -2130,11 +2131,14 @@ class ShellFileOperations(FileOperations):
 
         # Fallback: find (slower, no .gitignore awareness)
         if not self._has_command('find'):
-            return SearchResult(
-                error="File search requires 'rg' (ripgrep) or 'find'. "
-                      "Install ripgrep for best results: "
-                      "https://github.com/BurntSushi/ripgrep#installation"
-            )
+            # ponytail: Windows LTSC has no ripgrep/find on PATH (worker spawn
+            # inherits dispatcher env, _augment_path_with_known_tools skips
+            # non-existent dirs). Use stdlib pathlib+fnmatch instead of raising
+            # -- zero deps, ~50x slower than rg on wide trees, but search works.
+            # Upgrade: drop rg.exe into %LOCALAPPDATA%\hermes\git\usr\bin once
+            # and _augment_path_with_known_tools will pick it up automatically.
+            return self._search_files_stdlib(search_pattern, path, limit, offset,
+                                              has_hidden_path_ancestor)
 
         # Exclude hidden directories (matching ripgrep's default behavior).
         hidden_exclude = "-not -path '*/.*'" if not has_hidden_path_ancestor else ""
@@ -2239,7 +2243,60 @@ class ShellFileOperations(FileOperations):
             truncated=len(all_files) >= fetch_limit or bool(limit_reason),
             limit_reason=limit_reason,
         )
-    
+
+    def _search_files_stdlib(self, pattern: str, path: str, limit: int, offset: int,
+                              has_hidden_path_ancestor: bool) -> SearchResult:
+        """Pure-Python file search fallback (no rg/find on PATH).
+
+        Uses pathlib + fnmatch. Excludes hidden directories unless the search
+        root itself is hidden (matches rg/find default behavior above).
+        Sorted by mtime desc to match the rg --sortr=modified output.
+        """
+        root = Path(path)
+        if not root.exists() or not root.is_dir():
+            # Single file or missing dir -- return empty result (matches rg).
+            if root.is_file():
+                if fnmatch.fnmatch(root.name, pattern):
+                    return SearchResult(files=[str(root)], total_count=1)
+            return SearchResult(files=[], total_count=0)
+
+        # Walk with manual hidden filtering -- os.walk lets us prune via dirnames.
+        collected: list[tuple[float, str]] = []
+        # Cap total walk at 200k entries to bound the slow path on huge trees.
+        # ponytail: 200k ceiling; real rg hard-caps at 1000 results by default,
+        # so this fallback never gets called for the common case anyway.
+        walked = 0
+        _WALK_CEILING = 200_000
+        for dirpath, dirnames, filenames in os.walk(root):
+            if walked >= _WALK_CEILING:
+                break
+            # Prune hidden subdirs unless the search root itself is hidden.
+            if not has_hidden_path_ancestor:
+                dirnames[:] = [d for d in dirnames
+                               if not (d not in {".", ".."} and d.startswith("."))]
+            for fname in filenames:
+                walked += 1
+                if walked > _WALK_CEILING:
+                    break
+                if not fnmatch.fnmatch(fname, pattern):
+                    continue
+                full = os.path.join(dirpath, fname)
+                try:
+                    mtime = os.path.getmtime(full)
+                except OSError:
+                    mtime = 0.0
+                collected.append((mtime, full))
+
+        collected.sort(key=lambda x: x[0], reverse=True)
+        page = [p for _, p in collected[offset:offset + limit]]
+        return SearchResult(
+            files=page,
+            total_count=len(collected),
+            truncated=len(collected) > offset + limit,
+            limit_reason=("truncated: stdlib fallback walked 200k entry ceiling"
+                          if walked >= _WALK_CEILING else None),
+        )
+
     def _search_content(self, pattern: str, path: str, file_glob: Optional[str],
                         limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
         """Search for content inside files (grep-like)."""
@@ -2252,13 +2309,107 @@ class ShellFileOperations(FileOperations):
                                             output_mode, context)
         else:
             # Neither rg nor grep available (Windows without Git Bash, etc.)
-            return SearchResult(
-                error="Content search requires ripgrep (rg) or grep. "
-                      "Install ripgrep: https://github.com/BurntSushi/ripgrep#installation"
-            )
+            # ponytail: stdlib re+pathlib fallback -- zero deps, slower than rg
+            # but content search works on bare Windows LTSC. Same regex syntax
+            # as rg/grep (Python re accepts most POSIX-ERE patterns).
+            result = self._search_content_stdlib(pattern, path, file_glob,
+                                                  limit, offset, output_mode, context)
 
         return _maybe_warn_line_oriented_newline_pattern(result, pattern)
-    
+
+    def _search_content_stdlib(self, pattern: str, path: str, file_glob: Optional[str],
+                                limit: int, offset: int, output_mode: str,
+                                context: int) -> SearchResult:
+        """Pure-Python content search (no rg/grep on PATH).
+
+        Walks the tree with pathlib, opens each file as text (binary files are
+        skipped on UnicodeDecodeError), and applies re.search per line.
+        Matches rg semantics for the common output_mode values.
+        """
+        root = Path(path)
+        if root.is_file():
+            files_to_scan: list[Path] = [root]
+        elif root.is_dir():
+            files_to_scan = []
+            # ponytail: 200k file ceiling -- rg defaults to 1000 result lines,
+            # so this slow path is only the explicit no-tools fallback.
+            _WALK_CEILING = 200_000
+            walked = 0
+            for dirpath, dirnames, filenames in os.walk(root):
+                if walked >= _WALK_CEILING:
+                    break
+                dirnames[:] = [d for d in dirnames
+                               if not (d not in {".", ".."} and d.startswith("."))]
+                for fname in filenames:
+                    walked += 1
+                    if walked > _WALK_CEILING:
+                        break
+                    if file_glob and not fnmatch.fnmatch(fname, file_glob):
+                        continue
+                    files_to_scan.append(Path(dirpath) / fname)
+        else:
+            return SearchResult(error=f"Path not found: {path}", total_count=0)
+
+        try:
+            regex = re.compile(pattern)
+        except re.error as e:
+            return SearchResult(error=f"Invalid regex '{pattern}': {e}", total_count=0)
+
+        matches: list[SearchMatch] = []
+        counts: dict[str, int] = {}
+        files_with_matches: list[str] = []
+        truncated = False
+        _RESULT_CEILING = limit + offset + 200  # generous fetch for true total
+
+        for fpath in files_to_scan:
+            if len(matches) >= _RESULT_CEILING and output_mode != "count":
+                truncated = True
+                break
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                    lines = f.readlines()
+            except OSError:
+                continue
+            file_hit_count = 0
+            for lineno, line in enumerate(lines, 1):
+                if regex.search(line):
+                    file_hit_count += 1
+                    spath = str(fpath)
+                    if output_mode == "count":
+                        continue
+                    if len(matches) < _RESULT_CEILING:
+                        matches.append(SearchMatch(
+                            path=spath, line_number=lineno,
+                            content=line.rstrip("\n"),
+                            mtime=0.0,
+                        ))
+            if file_hit_count:
+                counts[str(fpath)] = file_hit_count
+                files_with_matches.append(str(fpath))
+
+        if output_mode == "files_only":
+            page = files_with_matches[offset:offset + limit]
+            return SearchResult(
+                files=page,
+                total_count=len(files_with_matches),
+                truncated=truncated,
+                limit_reason="truncated: stdlib fallback result ceiling" if truncated else None,
+            )
+        if output_mode == "count":
+            return SearchResult(
+                counts=counts,
+                total_count=sum(counts.values()),
+                truncated=False,
+            )
+        # content mode
+        page = matches[offset:offset + limit]
+        return SearchResult(
+            matches=page,
+            total_count=len(matches),
+            truncated=truncated,
+            limit_reason="truncated: stdlib fallback result ceiling" if truncated else None,
+        )
+
     def _search_with_rg(self, pattern: str, path: str, file_glob: Optional[str],
                         limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
         """Search using ripgrep."""
