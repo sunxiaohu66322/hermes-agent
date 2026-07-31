@@ -1873,6 +1873,33 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
             agent._client_log_context(),
         )
         return client
+    # Luban (Claude Code CLI via stream-json). Same external-process shape
+    # as copilot-acp but a different client speaking Claude's stream-json
+    # protocol. client_kwargs already carries command/args from the
+    # agent_init copilot-acp-style branch (provider in copilot-acp, luban).
+    if agent.provider == "luban" or str(client_kwargs.get("base_url", "")).startswith("acp://claude-code"):
+        from plugins.model_providers.claude_code.claude_client import ClaudeStreamJsonClient
+
+        client = ClaudeStreamJsonClient(**client_kwargs)
+        _ra().logger.info(
+            "Luban (Claude Code CLI) client created (%s, shared=%s) %s",
+            reason,
+            shared,
+            agent._client_log_context(),
+        )
+        return client
+    # Mogong (Codex CLI via exec JSONL). Symmetric to luban.
+    if agent.provider == "mogong" or str(client_kwargs.get("base_url", "")).startswith("acp://codex"):
+        from plugins.model_providers.mogong.codex_client import CodexStreamJsonClient
+
+        client = CodexStreamJsonClient(**client_kwargs)
+        _ra().logger.info(
+            "Mogong (Codex CLI) client created (%s, shared=%s) %s",
+            reason,
+            shared,
+            agent._client_log_context(),
+        )
+        return client
     if agent.provider == "gemini":
         from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
 

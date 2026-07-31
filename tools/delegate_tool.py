@@ -1289,9 +1289,17 @@ def _build_child_agent(
         effective_acp_args = []
 
     if override_acp_command:
-        # If explicitly forcing an ACP transport override, the provider MUST be copilot-acp
-        # so run_agent.py initializes the CopilotACPClient.
-        effective_provider = "copilot-acp"
+        # An ACP transport override is in effect. The original code forced
+        # provider="copilot-acp" unconditionally, but that breaks luban
+        # (Claude Code CLI) — it would route to CopilotACPClient (ACP
+        # JSON-RPC) instead of ClaudeStreamJsonClient (Claude stream-json).
+        # Preserve the override_provider when it is itself an external-process
+        # ACP provider; only force copilot-acp for the legacy case where
+        # override_provider was not an ACP provider but acp_command was set.
+        if override_provider in ("copilot-acp", "luban", "mogong"):
+            effective_provider = override_provider
+        else:
+            effective_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
     # Resolve reasoning config: delegation override > parent inherit

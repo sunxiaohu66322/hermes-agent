@@ -656,7 +656,11 @@ def init_agent(
         api_mode is None
         and agent.api_mode == "chat_completions"
         and agent.provider != "copilot-acp"
+        and agent.provider != "luban"
+        and agent.provider != "mogong"
         and not str(agent.base_url or "").lower().startswith("acp://copilot")
+        and not str(agent.base_url or "").lower().startswith("acp://claude-code")
+        and not str(agent.base_url or "").lower().startswith("acp://codex")
         and not str(agent.base_url or "").lower().startswith("acp+tcp://")
         and not agent._is_azure_openai_url()
         and (
@@ -1099,7 +1103,11 @@ def init_agent(
                 client_kwargs = {"api_key": api_key, "base_url": base_url}
             if _provider_timeout is not None:
                 client_kwargs["timeout"] = _provider_timeout
-            if agent.provider == "copilot-acp":
+            # copilot-acp, luban (Claude Code CLI) AND mogong (Codex CLI) are
+            # external-process transports that carry command/args in
+            # agent.acp_command/args. All routed to their client class in
+            # agent_runtime_helpers (build_agent_client).
+            if agent.provider in ("copilot-acp", "luban", "mogong"):
                 client_kwargs["command"] = agent.acp_command
                 client_kwargs["args"] = agent.acp_args
             effective_base = base_url

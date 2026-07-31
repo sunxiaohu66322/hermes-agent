@@ -1892,6 +1892,97 @@ def resolve_runtime_provider(
             "requested_provider": requested_provider,
         }
 
+    # Luban (Claude Code CLI via stream-json subprocess) — 鲁班 transport.
+    # External process like copilot-acp, but speaks Claude Code's stream-json
+    # protocol (not ACP JSON-RPC). The ClaudeStreamJsonClient lives in the
+    # plugins/model-providers/claude-code/ plugin; this branch only resolves
+    # command/args so _resolve_delegation_credentials can pass them through.
+    # ponytail: command/args resolution duplicated from claude_client._resolve_command
+    # to avoid a runtime_provider→plugin import (cycle risk). Keep in sync.
+    if provider == "luban":
+        import shutil as _shutil_luban
+        _luban_cmd = os.environ.get("HERMES_CLAUDE_COMMAND", "").strip()
+        if _luban_cmd:
+            _luban_resolved = _shutil_luban.which(_luban_cmd) or _luban_cmd
+        else:
+            _luban_resolved = None
+            for _cand in ("claude", "claude.exe", "claude.bat"):
+                _hit = _shutil_luban.which(_cand)
+                if _hit:
+                    _luban_resolved = _hit
+                    break
+        if not _luban_resolved:
+            raise AuthError(
+                "Could not find the `claude` CLI on PATH for the luban provider. "
+                "Install Claude Code or set HERMES_CLAUDE_COMMAND.",
+                provider=provider,
+                code="missing_claude_cli",
+            )
+        _luban_args = [
+            "--print",
+            "--input-format", "stream-json",
+            "--output-format", "stream-json",
+            "--verbose",
+        ]
+        if os.environ.get("HERMES_CLAUDE_SKIP_PERMS", "").strip().lower() in ("1", "true", "yes"):
+            _luban_args.append("--dangerously-skip-permissions")
+        _luban_extra = os.environ.get("HERMES_CLAUDE_ARGS", "").strip()
+        if _luban_extra:
+            import shlex as _shlex_luban
+            _luban_args.extend(_shlex_luban.split(_luban_extra))
+        return {
+            "provider": "luban",
+            "api_mode": "chat_completions",
+            "base_url": "acp://claude-code",
+            "api_key": "luban",
+            "command": _luban_resolved,
+            "args": _luban_args,
+            "source": "process",
+            "requested_provider": requested_provider,
+        }
+
+    # Mogong (Codex CLI via exec --json subprocess) — 墨工 transport.
+    # Symmetric to luban; codex auth comes from ~/.codex/auth.json so no
+    # api_key is resolved here. ponytail: command/args resolution mirrored
+    # from codex_client._resolve_command — keep in sync.
+    if provider == "mogong":
+        import shutil as _shutil_mogong
+        _mogong_cmd = os.environ.get("HERMES_CODEX_COMMAND", "").strip()
+        if _mogong_cmd:
+            _mogong_resolved = _shutil_mogong.which(_mogong_cmd) or _mogong_cmd
+        else:
+            _mogong_resolved = None
+            for _cand in ("codex", "codex.exe", "codex.bat"):
+                _hit = _shutil_mogong.which(_cand)
+                if _hit:
+                    _mogong_resolved = _hit
+                    break
+        if not _mogong_resolved:
+            raise AuthError(
+                "Could not find the `codex` CLI on PATH for the mogong provider. "
+                "Install Codex CLI or set HERMES_CODEX_COMMAND.",
+                provider=provider,
+                code="missing_codex_cli",
+            )
+        _mogong_args = ["exec", "--json", "--skip-git-repo-check", "-"]
+        if os.environ.get("HERMES_CODEX_BYPASS", "").strip().lower() in ("1", "true", "yes"):
+            _mogong_args.append("--dangerously-bypass-approvals-and-sandbox")
+        _mogong_extra = os.environ.get("HERMES_CODEX_ARGS", "").strip()
+        if _mogong_extra:
+            import shlex as _shlex_mogong
+            _mogong_args.extend(_shlex_mogong.split(_mogong_extra))
+        return {
+            "provider": "mogong",
+            "api_mode": "chat_completions",
+            "base_url": "acp://codex",
+            "api_key": "mogong",
+            "command": _mogong_resolved,
+            "args": _mogong_args,
+            "source": "process",
+            "requested_provider": requested_provider,
+        }
+
+
     # Anthropic (native Messages API)
     if provider == "anthropic":
         # Allow base URL override from config.yaml model.base_url, but only

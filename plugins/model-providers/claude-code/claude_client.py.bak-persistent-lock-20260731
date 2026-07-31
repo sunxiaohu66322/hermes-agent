@@ -1,0 +1,428 @@
+"""ClaudeStreamJsonClient — wraps the `claude` CLI (Claude Code) as an
+OpenAI-compatible chat.completions facade for Hermes delegation.
+
+This is the transport for the 鲁班 (Luban = Claude Code CLI) line. Hermes
+spawns `claude --print --input-format stream-json --output-format stream-json`
+as a subprocess, feeds it a single user message, and reads the streamed JSON
+events back. Unlike CopilotACPClient (which speaks ACP JSON-RPC), this client
+speaks Claude Code's own stream-json event protocol:
+
+  - input (one JSON line on stdin):
+      {"type":"user","message":{"role":"user","content":[{"type":"text","text":"<goal>"}]}}
+  - output (JSON lines on stdout):
+      {"type":"system","subtype":"init",...}     # session metadata, ignored
+      {"type":"assistant","message":{...}}        # streamed text fragments, ignored
+      {"type":"result","result":"<final text>","subtype":"success",...}  # TERMINAL
+
+The client waits for the `result` event and returns its `result` field as the
+assistant content. Streaming is emulated (the subprocess runs to completion
+before we emit OpenAI-style chunks) — same pattern CopilotACPClient uses, since
+`claude --print` does not surface incremental OpenAI deltas.
+
+Tools passed by run_agent are ACCEPTED BUT IGNORED: Claude Code has its own
+native toolset (Bash/Read/Edit/...), and delegated goals are self-contained by
+the delegate_task contract. We log this so it is auditable, never silent.
+
+ ponytail: external subprocess transport — the subprocess is one-shot per
+ chat.completions.create() call. A long-running ACP-style persistent session
+ would be the upgrade path if per-call spawn latency becomes a bottleneck.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import shlex
+import shutil
+import subprocess
+import threading
+import time
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, List, Optional
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_TIMEOUT_SECONDS = 1800.0  # 30 min — matches delegation.child_timeout ceiling
+
+# Default args for the claude CLI. --dangerously-skip-permissions is NOT here;
+# it is added only when HERMES_CLAUDE_SKIP_PERMS=true (default false = safe).
+_DEFAULT_ARGS = [
+    "--print",
+    "--input-format", "stream-json",
+    "--output-format", "stream-json",
+    "--verbose",
+]
+
+
+def _resolve_command() -> str:
+    """Find the claude CLI binary robustly.
+
+    Tries PATH lookup for claude / claude.exe / claude.bat, then the
+    HERMES_CLAUDE_COMMAND env override. Raises FileNotFoundError if none found.
+    """
+    env_cmd = os.environ.get("HERMES_CLAUDE_COMMAND", "").strip()
+    if env_cmd:
+        resolved = shutil.which(env_cmd) or env_cmd
+        return resolved
+
+    for candidate in ("claude", "claude.exe", "claude.bat"):
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+
+    raise FileNotFoundError(
+        "Could not find the `claude` CLI on PATH. Install Claude Code, or set "
+        "HERMES_CLAUDE_COMMAND to the binary path."
+    )
+
+
+def _resolve_args() -> List[str]:
+    """Build the claude CLI args, honoring the skip-permissions env flag."""
+    args = list(_DEFAULT_ARGS)
+
+    skip_perms = os.environ.get("HERMES_CLAUDE_SKIP_PERMS", "").strip().lower()
+    if skip_perms in ("1", "true", "yes"):
+        args.append("--dangerously-skip-permissions")
+
+    env_args = os.environ.get("HERMES_CLAUDE_ARGS", "").strip()
+    if env_args:
+        args.extend(shlex.split(env_args))
+
+    return args
+
+
+def _build_subprocess_env() -> dict:
+    """Build env for the subprocess — inherit the parent so claude's auth
+    (ANTHROPIC_API_KEY / config) and PATH propagate. Mirrors CopilotACPClient."""
+    env = dict(os.environ)
+    # Ensure HOME is set so claude finds ~/.claude
+    env.setdefault("HOME", str(Path.home()))
+    return env
+
+
+def _format_messages_as_prompt(messages: List[dict]) -> str:
+    """Flatten OpenAI-style messages into a single prompt text for claude.
+
+    Claude Code gets ONE user turn per `--print` invocation. We fold the
+    conversation transcript into a single text block. System messages become
+    a leading directive; the last user message is the goal.
+    """
+    system_parts: List[str] = []
+    transcript: List[str] = []
+
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "user").strip().lower()
+        content = message.get("content")
+        if isinstance(content, list):
+            # OpenAI content-block list — extract text parts
+            text_parts = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text_parts.append(str(block.get("text", "")))
+                elif isinstance(block, str):
+                    text_parts.append(block)
+            rendered = "\n".join(p for p in text_parts if p)
+        elif isinstance(content, str):
+            rendered = content
+        else:
+            continue
+        if not rendered.strip():
+            continue
+
+        if role == "system":
+            system_parts.append(rendered)
+        else:
+            label = {"user": "User", "assistant": "Assistant", "tool": "Tool"}.get(role, role.title())
+            transcript.append(f"{label}:\n{rendered}")
+
+    sections: List[str] = []
+    if system_parts:
+        sections.append("System instructions:\n" + "\n\n".join(system_parts))
+    if transcript:
+        sections.append("Conversation transcript:\n\n" + "\n\n".join(transcript))
+    if not sections:
+        return ""
+    return "\n\n".join(sections)
+
+
+def _completion_to_stream_chunks(completion: SimpleNamespace) -> List[SimpleNamespace]:
+    """Convert a one-shot response into OpenAI-style stream chunks (emulated streaming)."""
+    choice = completion.choices[0]
+    message = choice.message
+    delta = SimpleNamespace(
+        role="assistant",
+        content=message.content or None,
+        tool_calls=None,
+        reasoning_content=getattr(message, "reasoning_content", None),
+        reasoning=getattr(message, "reasoning", None),
+    )
+    data_chunk = SimpleNamespace(
+        choices=[SimpleNamespace(index=0, delta=delta, finish_reason=choice.finish_reason)],
+        model=completion.model,
+        usage=None,
+    )
+    usage_chunk = SimpleNamespace(
+        choices=[],
+        model=completion.model,
+        usage=completion.usage,
+    )
+    return [data_chunk, usage_chunk]
+
+
+class _ClaudeChatCompletions:
+    def __init__(self, client: "ClaudeStreamJsonClient"):
+        self._client = client
+
+    def create(self, **kwargs: Any) -> Any:
+        return self._client._create_chat_completion(**kwargs)
+
+
+class _ClaudeChatNamespace:
+    def __init__(self, client: "ClaudeStreamJsonClient"):
+        self.completions = _ClaudeChatCompletions(client)
+
+
+class ClaudeStreamJsonClient:
+    """OpenAI-compatible facade over the `claude` CLI stream-json subprocess."""
+
+    def __init__(
+        self,
+        *,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        default_headers: Optional[dict] = None,
+        command: Optional[str] = None,
+        args: Optional[List[str]] = None,
+        acp_command: Optional[str] = None,
+        acp_args: Optional[List[str]] = None,
+        acp_cwd: Optional[str] = None,
+        **_: Any,
+    ):
+        self.api_key = api_key or "claude-code"
+        self.base_url = base_url or "acp://claude-code"
+        self._default_headers = dict(default_headers or {})
+        # command/args: explicit ctor args > env resolution
+        self._command = command or acp_command or _resolve_command()
+        self._args = list(args or acp_args or _resolve_args())
+        self._cwd = str(Path(acp_cwd or os.getcwd()).resolve())
+        self.chat = _ClaudeChatNamespace(self)
+        self.is_closed = False
+        self._active_process: Optional[subprocess.Popen] = None
+        self._active_process_lock = threading.Lock()
+
+    def close(self) -> None:
+        proc: Optional[subprocess.Popen]
+        with self._active_process_lock:
+            proc = self._active_process
+            self._active_process = None
+        self.is_closed = True
+        if proc is None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def _create_chat_completion(
+        self,
+        *,
+        model: Optional[str] = None,
+        messages: Optional[List[dict]] = None,
+        timeout: Optional[float] = None,
+        tools: Optional[List[dict]] = None,
+        tool_choice: Any = None,
+        stream: bool = False,
+        **_: Any,
+    ) -> Any:
+        # Tools are accepted but ignored — Claude Code uses its native toolset.
+        if isinstance(tools, list) and tools:
+            logger.info(
+                "ClaudeStreamJsonClient: %d tools passed but ignored (Claude Code uses native tools). "
+                "Delegated goal must be self-contained.",
+                len(tools),
+            )
+
+        prompt_text = _format_messages_as_prompt(messages or [])
+        if not prompt_text.strip():
+            prompt_text = "(empty prompt)"
+
+        # Normalise timeout (run_agent may pass httpx.Timeout)
+        if timeout is None:
+            effective_timeout = _DEFAULT_TIMEOUT_SECONDS
+        elif isinstance(timeout, (int, float)):
+            effective_timeout = float(timeout)
+        else:
+            candidates = [getattr(timeout, attr, None) for attr in ("read", "write", "connect", "pool", "timeout")]
+            numeric = [float(v) for v in candidates if isinstance(v, (int, float))]
+            effective_timeout = max(numeric) if numeric else _DEFAULT_TIMEOUT_SECONDS
+
+        result_text = self._run_prompt(prompt_text, timeout_seconds=effective_timeout)
+
+        usage = SimpleNamespace(
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=0,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=0),
+        )
+        assistant_message = SimpleNamespace(
+            content=result_text,
+            tool_calls=[],
+            reasoning=None,
+            reasoning_content=None,
+            reasoning_details=None,
+        )
+        choice = SimpleNamespace(message=assistant_message, finish_reason="stop")
+        completion = SimpleNamespace(
+            choices=[choice],
+            usage=usage,
+            model=model or "claude-code",
+        )
+        if stream:
+            return _completion_to_stream_chunks(completion)
+        return completion
+
+
+    def _ensure_persistent_process(self):
+        """Ensure a persistent claude process is alive; recycle if idle too long."""
+        with self._persistent_lock:
+            if self._persistent_proc and self._persistent_proc.poll() is None:
+                if time.monotonic() - self._last_active > self._idle_timeout:
+                    logger.debug("claude persistent proc idle %.0fs, recycling",
+                                 time.monotonic() - self._last_active)
+                    try:
+                        self._persistent_proc.terminate()
+                        self._persistent_proc.wait(timeout=5)
+                    except Exception:
+                        try:
+                            self._persistent_proc.kill()
+                        except Exception:
+                            pass
+                    self._persistent_proc = None
+                else:
+                    return self._persistent_proc  # still alive
+
+            # Start fresh persistent process
+            try:
+                proc = subprocess.Popen(
+                    [self._command] + self._args,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                    cwd=self._cwd,
+                    env=_build_subprocess_env(),
+                )
+            except FileNotFoundError as exc:
+                raise RuntimeError(
+                    f"Could not start claude CLI command '{self._command}'. "
+                    "Install Claude Code or set HERMES_CLAUDE_COMMAND."
+                ) from exc
+
+            self._persistent_proc = proc
+            self._last_active = time.monotonic()
+            logger.info("claude persistent proc started (pid=%s)", proc.pid)
+            return proc
+
+    def _persistent_send_and_recv(self, proc, prompt_text, timeout_seconds):
+        """Send a prompt to the persistent claude process and read the result."""
+        request_line = json.dumps({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": prompt_text}],
+            },
+        })
+
+        # Start stderr reader thread (daemon, shares stderr_tail list)
+        stderr_tail: List[str] = []
+
+        def _stderr_reader():
+            if proc.stderr is None:
+                return
+            for line in proc.stderr:
+                stderr_tail.append(line.rstrip("\n"))
+
+        err_thread = threading.Thread(target=_stderr_reader, daemon=True)
+        err_thread.start()
+
+        # Write request (do NOT close stdin — persistent mode)
+        proc.stdin.write(request_line + "\n")
+        proc.stdin.flush()
+        self._last_active = time.monotonic()
+
+        result_text = None
+        deadline = time.monotonic() + timeout_seconds
+        for raw_line in proc.stdout:
+            if time.monotonic() > deadline:
+                logger.warning("claude persistent recv timed out after %.0fs", timeout_seconds)
+                break
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except Exception:
+                continue
+            etype = event.get("type")
+            if etype == "result":
+                result_text = event.get("result", "")
+                break
+
+        self._last_active = time.monotonic()
+        self._call_count += 1
+
+        if result_text is not None:
+            logger.info("claude persistent call #%d completed (pid=%s)",
+                        self._call_count, proc.pid)
+            return result_text
+
+        # Process may have died
+        if proc.poll() is not None:
+            logger.warning("claude persistent proc exited (code=%s), will restart next call",
+                           proc.poll())
+            with self._persistent_lock:
+                self._persistent_proc = None
+
+        stderr_excerpt = "\n".join(stderr_tail[-15:])
+        raise RuntimeError(
+            f"claude CLI persistent did not produce result. "
+            f"exit_code={proc.poll()} stderr_tail:\n{stderr_excerpt}"
+        )
+
+    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> str:
+        """Spawn claude CLI, feed the prompt as one stream-json user message,
+        read stdout JSON lines until a `result` event arrives, return its text."""
+        # Build the single user-message JSON line per Claude stream-json protocol
+        request_line = json.dumps({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": prompt_text}],
+            },
+        })
+
+        # P0-1: Use persistent process instead of one-shot subprocess
+        try:
+            proc = self._ensure_persistent_process()
+            return self._persistent_send_and_recv(proc, prompt_text, timeout_seconds)
+        except RuntimeError:
+            # If persistent proc failed, force recycle and retry once
+            with self._persistent_lock:
+                if self._persistent_proc:
+                    try:
+                        self._persistent_proc.kill()
+                    except Exception:
+                        pass
+                    self._persistent_proc = None
+            logger.warning("claude persistent failed, retrying with fresh process")
+            proc = self._ensure_persistent_process()
+            return self._persistent_send_and_recv(proc, prompt_text, timeout_seconds)

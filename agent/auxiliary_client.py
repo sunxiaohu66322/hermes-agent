@@ -5256,6 +5256,95 @@ def resolve_provider_client(
                 else (client, final_model))
 
     if pconfig.auth_type == "external_process":
+        # Luban (Claude Code CLI) uses its own credential resolution — the
+        # shared resolve_external_process_provider_credentials() is hardcoded
+        # to the Copilot CLI. Route luban through resolve_runtime_provider
+        # (luban branch) which returns command/args from env/PATH lookup.
+        # The client is ClaudeStreamJsonClient from the plugin package.
+        if provider == "luban":
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+            try:
+                creds = resolve_runtime_provider(requested=provider, target_model=model)
+            except Exception as exc:
+                logger.warning(
+                    "resolve_provider_client: luban credential resolution failed: %s", exc
+                )
+                return None, None
+            final_model = _normalize_resolved_model(
+                model
+                or (main_runtime.get("model") if main_runtime else None)
+                or _read_main_model(),
+                provider,
+            )
+            if not final_model:
+                logger.warning(
+                    "resolve_provider_client: luban requested but no model "
+                    "was provided or configured"
+                )
+                return None, None
+            command = str(creds.get("command", "")).strip() or None
+            args = list(creds.get("args") or [])
+            if not command:
+                logger.warning(
+                    "resolve_provider_client: luban requested but claude CLI "
+                    "command not resolved"
+                )
+                return None, None
+            from plugins.model_providers.claude_code.claude_client import ClaudeStreamJsonClient
+
+            client = ClaudeStreamJsonClient(
+                api_key="luban",
+                base_url=str(creds.get("base_url", "acp://claude-code")),
+                command=command,
+                args=args,
+            )
+            logger.debug("resolve_provider_client: luban (%s)", final_model)
+            return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                    else (client, final_model))
+
+        # Mogong (Codex CLI) — symmetric to luban. Same external-process
+        # shape but CodexStreamJsonClient speaking codex exec JSONL.
+        if provider == "mogong":
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+            try:
+                creds = resolve_runtime_provider(requested=provider, target_model=model)
+            except Exception as exc:
+                logger.warning(
+                    "resolve_provider_client: mogong credential resolution failed: %s", exc
+                )
+                return None, None
+            final_model = _normalize_resolved_model(
+                model
+                or (main_runtime.get("model") if main_runtime else None)
+                or _read_main_model(),
+                provider,
+            )
+            if not final_model:
+                logger.warning(
+                    "resolve_provider_client: mogong requested but no model "
+                    "was provided or configured"
+                )
+                return None, None
+            command = str(creds.get("command", "")).strip() or None
+            args = list(creds.get("args") or [])
+            if not command:
+                logger.warning(
+                    "resolve_provider_client: mogong requested but codex CLI "
+                    "command not resolved"
+                )
+                return None, None
+            from plugins.model_providers.mogong.codex_client import CodexStreamJsonClient
+
+            client = CodexStreamJsonClient(
+                api_key="mogong",
+                base_url=str(creds.get("base_url", "acp://codex")),
+                command=command,
+                args=args,
+            )
+            logger.debug("resolve_provider_client: mogong (%s)", final_model)
+            return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                    else (client, final_model))
+
         creds = resolve_external_process_provider_credentials(provider)
         final_model = _normalize_resolved_model(
             model

@@ -232,6 +232,28 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
         base_url_env_var="COPILOT_ACP_BASE_URL",
     ),
+    # Luban = Claude Code CLI via stream-json subprocess (鲁班 transport).
+    # Registered here (like copilot-acp) because the auto-extend block at
+    # line ~455 only picks up auth_type="api_key" profiles — external_process
+    # providers must be declared in this dict to be recognized by
+    # resolve_provider(). The actual client (ClaudeStreamJsonClient) lives in
+    # plugins/model-providers/claude-code/; command/args resolution is in
+    # runtime_provider.resolve_runtime_provider() (luban branch).
+    "luban": ProviderConfig(
+        id="luban",
+        name="Claude Code CLI (Luban)",
+        auth_type="external_process",
+        inference_base_url="acp://claude-code",
+    ),
+    # Mogong = Codex CLI via exec --json subprocess (墨工 transport).
+    # Symmetric to luban; auth from ~/.codex/auth.json (OPENAI_API_KEY).
+    # Client = CodexStreamJsonClient in plugins/model-providers/mogong/.
+    "mogong": ProviderConfig(
+        id="mogong",
+        name="Codex CLI (Mogong)",
+        auth_type="external_process",
+        inference_base_url="acp://codex",
+    ),
     "gemini": ProviderConfig(
         id="gemini",
         name="Google AI Studio",
