@@ -2516,7 +2516,7 @@ def delegate_task(
     # used by CLI/gateway startup.  When unconfigured, returns None values so
     # children inherit from the parent.
     try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
+        creds = _resolve_delegation_credentials(cfg, parent_agent, goal=goal)
     except ValueError as exc:
         return tool_error(str(exc))
 
@@ -3165,7 +3165,7 @@ def _resolve_child_credential_pool(
     return None
 
 
-def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
+def _resolve_delegation_credentials(cfg: dict, parent_agent, goal: Optional[str] = None) -> dict:
     """Resolve credentials for subagent delegation.
 
     If ``delegation.base_url`` is configured, subagents use that direct
@@ -3191,6 +3191,25 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     configured_base_url = str(cfg.get("base_url") or "").strip() or None
     configured_api_key = str(cfg.get("api_key") or "").strip() or None
     configured_api_mode = str(cfg.get("api_mode") or "").strip().lower() or None
+
+    # Keyword-based provider routing: when no explicit provider is configured
+    # (or it's the generic 'custom'), infer the provider from the delegated
+    # goal so code-editing tasks land on 'luban' and setup/deploy tasks on
+    # 'mogong' without requiring the caller to set delegation.provider.
+    if configured_provider in (None, "custom") and goal:
+        _goal_lower = goal.lower()
+        _code_edit_re = re.compile(r"(写|改|修|bug|fix|refactor).*(\.py|\.js|\.ts)", re.IGNORECASE)
+        _ops_re = re.compile(r"(安装|部署|配置|install|deploy|config)", re.IGNORECASE)
+        if _code_edit_re.search(goal) or (_code_edit_re.search(_goal_lower) and re.search(r"\.(py|js|ts)", _goal_lower)):
+            configured_provider = "luban"
+            logger.info(
+                "delegation credential route: goal matched code-edit keywords -> provider='luban'"
+            )
+        elif _ops_re.search(_goal_lower):
+            configured_provider = "mogong"
+            logger.info(
+                "delegation credential route: goal matched setup/deploy keywords -> provider='mogong'"
+            )
 
     # Native-SDK providers (Bedrock, Vertex, Google GenAI) speak their own
     # wire protocol — they cannot be reached via OpenAI chat_completions against
