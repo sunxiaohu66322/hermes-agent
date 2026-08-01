@@ -4606,6 +4606,20 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
             return sync_client, model
     except ImportError:
         pass
+    # ClaudeStreamJsonClient (luban provider) — sync subprocess transport,
+    # not a real async OpenAI client. Return as-is to preserve subprocess comms.
+    try:
+        from plugins.model_providers.claude_code.claude_client import ClaudeStreamJsonClient
+        if isinstance(sync_client, ClaudeStreamJsonClient):
+            return sync_client, model
+    except ImportError:
+        pass
+    try:
+        from plugins.model_providers.mogong.codex_client import CodexStreamJsonClient
+        if isinstance(sync_client, CodexStreamJsonClient):
+            return sync_client, model
+    except ImportError:
+        pass
 
     async_kwargs = {
         "api_key": sync_client.api_key,
