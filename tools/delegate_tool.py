@@ -20,9 +20,8 @@ never the child's intermediate tool calls or reasoning.
 import enum
 import json
 import logging
-
-logger = logging.getLogger(__name__)
 import os
+import re
 import threading
 import time
 from concurrent.futures import (
@@ -30,6 +29,8 @@ from concurrent.futures import (
     TimeoutError as FuturesTimeoutError,
 )
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 from toolsets import TOOLSETS
 
@@ -3198,14 +3199,14 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent, goal: Optional[str]
     # 'mogong' without requiring the caller to set delegation.provider.
     if configured_provider in (None, "custom") and goal:
         _goal_lower = goal.lower()
-        _code_edit_re = re.compile(r"(写|改|修|bug|fix|refactor).*(\.py|\.js|\.ts)", re.IGNORECASE)
-        _ops_re = re.compile(r"(安装|部署|配置|install|deploy|config)", re.IGNORECASE)
-        if _code_edit_re.search(goal) or (_code_edit_re.search(_goal_lower) and re.search(r"\.(py|js|ts)", _goal_lower)):
+        _has_code_action = bool(re.search(r"写|改|修|bug|fix|refactor", _goal_lower))
+        _has_code_ext = bool(re.search(r"\.(py|js|ts)\b", _goal_lower))
+        if _has_code_action and _has_code_ext:
             configured_provider = "luban"
             logger.info(
                 "delegation credential route: goal matched code-edit keywords -> provider='luban'"
             )
-        elif _ops_re.search(_goal_lower):
+        elif re.search(r"安装|部署|配置|install|deploy|config", _goal_lower):
             configured_provider = "mogong"
             logger.info(
                 "delegation credential route: goal matched setup/deploy keywords -> provider='mogong'"
