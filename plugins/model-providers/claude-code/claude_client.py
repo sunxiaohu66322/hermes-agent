@@ -217,30 +217,45 @@ class ClaudeStreamJsonClient:
         self._idle_timeout = 86400.0  # 24h persistent proc idle timeout (was 600s)
 
     def close(self) -> None:
-        """Close one-shot process but KEEP persistent process alive for reuse.
+        """Close one-shot process and clean up the shared process pool.
 
-        The persistent claude process (_persistent_proc) is expensive to start
-        (30-40s cold start). We intentionally do NOT kill it here so subsequent
-        delegate_task / dispatch_to_luban calls can reuse it (5-7s warm).
-        The persistent proc auto-recycles after _idle_timeout (default 600s).
+        Tears down ALL slots in the module-level _shared_proc_pool so the
+        singleton (and any parallel callers) release their claude processes
+        on shutdown. Each slot is terminated gently then killed.
         """
         proc: Optional[subprocess.Popen]
         with self._active_process_lock:
             proc = self._active_process
             self._active_process = None
-        # Do NOT close _persistent_proc — it stays alive for reuse
-        # Don't set is_closed=True either — the singleton stays usable
-        # self.is_closed = True  # commented out: we keep the instance alive
-        if proc is None:
-            return
-        try:
-            proc.terminate()
-            proc.wait(timeout=2)
-        except Exception:
+        if proc is not None:
             try:
-                proc.kill()
+                proc.terminate()
+                proc.wait(timeout=2)
             except Exception:
-                pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+        # Tear down every pool slot. Each slot has its own lock; we take them
+        # in order and clear busy + proc. Don't hold the singleton alive.
+        for i in range(_pool_size):
+            with _shared_proc_locks[i]:
+                _shared_proc_busy[i] = False
+                p = _shared_proc_pool[i]
+                _shared_proc_pool[i] = None
+            if p is None:
+                continue
+            try:
+                if p.poll() is None:
+                    p.terminate()
+                    p.wait(timeout=3)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+            logger.info("claude pool slot %d closed (pid=%s)", i, getattr(p, "pid", "?"))
 
     def _create_chat_completion(
         self,
@@ -301,59 +316,108 @@ class ClaudeStreamJsonClient:
         return completion
 
 
-    def _ensure_persistent_process(self):
-        """Ensure a shared persistent claude process is alive; recycle if idle too long.
+    def _start_pool_proc(self, slot_index: int) -> subprocess.Popen:
+        """Start a fresh claude process for the given pool slot."""
+        try:
+            proc = subprocess.Popen(
+                [self._command] + self._args,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                cwd=self._cwd,
+                env=_build_subprocess_env(),
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"Could not start claude CLI command '{self._command}'. "
+                "Install Claude Code or set HERMES_CLAUDE_COMMAND."
+            ) from exc
+        _shared_slot_last_active[slot_index] = time.monotonic()
+        logger.info("claude pool slot %d proc started (pid=%s)", slot_index, proc.pid)
+        return proc
 
-        Uses module-level shared process so ALL ClaudeStreamJsonClient instances
-        (including those created by delegate_task child agents and dispatch_to_luban)
-        reuse the same claude process. First call = 30-40s cold start; subsequent
-        calls = 5-7s warm start regardless of which instance initiates the call.
+    def _acquire_pool_slot(self):
+        """Acquire an idle pool slot, starting the claude process if needed.
+
+        Returns (slot_index, proc). If all slots are busy, waits for the
+        first one to free up (with a generous timeout, then falls back to
+        forcing the next slot). Marks the slot busy under its own lock so
+        two callers never share the same proc's stdin/stdout.
         """
-        global _shared_persistent_proc, _shared_last_active, _shared_call_count
-        with _shared_persistent_lock:
-            if _shared_persistent_proc and _shared_persistent_proc.poll() is None:
-                if time.monotonic() - _shared_last_active > self._idle_timeout:
-                    logger.debug("claude shared proc idle %.0fs, recycling",
-                                 time.monotonic() - _shared_last_active)
-                    try:
-                        _shared_persistent_proc.terminate()
-                        _shared_persistent_proc.wait(timeout=5)
-                    except Exception:
+        # Fast path: find a free slot.
+        wait_deadline = time.monotonic() + _DEFAULT_TIMEOUT_SECONDS
+        while True:
+            for i in range(_pool_size):
+                if _shared_proc_busy[i]:
+                    continue
+                # Tentatively grab this slot's lock to claim it.
+                with _shared_proc_locks[i]:
+                    if _shared_proc_busy[i]:
+                        continue  # lost a race, retry
+                    proc = _shared_proc_pool[i]
+                    # Recycle if dead, or if idle past the idle timeout.
+                    if proc is not None and proc.poll() is not None:
+                        logger.debug("claude pool slot %d proc exited (code=%s), recycling",
+                                     i, proc.poll())
+                        proc = None
+                        _shared_proc_pool[i] = None
+                    elif (proc is not None
+                          and time.monotonic() - _shared_slot_last_active[i] > self._idle_timeout):
+                        logger.debug("claude pool slot %d idle %.0fs, recycling",
+                                     i, time.monotonic() - _shared_slot_last_active[i])
                         try:
-                            _shared_persistent_proc.kill()
+                            proc.terminate()
+                            proc.wait(timeout=5)
                         except Exception:
-                            pass
-                    _shared_persistent_proc = None
-                else:
-                    return _shared_persistent_proc  # still alive, reuse
+                            try:
+                                proc.kill()
+                            except Exception:
+                                pass
+                        proc = None
+                        _shared_proc_pool[i] = None
+                    if proc is None:
+                        proc = self._start_pool_proc(i)
+                        _shared_proc_pool[i] = proc
+                    _shared_proc_busy[i] = True
+                    # back-comat mirror to instance for any legacy reader
+                    self._persistent_proc = proc
+                    return i, proc
+            # All slots busy — wait briefly and retry.
+            if time.monotonic() > wait_deadline:
+                # Last resort: force-claim slot 0 to avoid deadlock.
+                logger.warning("claude pool all %d slots busy past timeout; forcing slot 0", _pool_size)
+                i = 0
+                with _shared_proc_locks[i]:
+                    _shared_proc_busy[i] = True
+                    proc = _shared_proc_pool[i]
+                    if proc is None or proc.poll() is not None:
+                        proc = self._start_pool_proc(i)
+                        _shared_proc_pool[i] = proc
+                    self._persistent_proc = proc
+                    return i, proc
+            time.sleep(0.05)
 
-            # Start fresh shared persistent process
-            try:
-                proc = subprocess.Popen(
-                    [self._command] + self._args,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    bufsize=1,
-                    cwd=self._cwd,
-                    env=_build_subprocess_env(),
-                )
-            except FileNotFoundError as exc:
-                raise RuntimeError(
-                    f"Could not start claude CLI command '{self._command}'. "
-                    "Install Claude Code or set HERMES_CLAUDE_COMMAND."
-                ) from exc
+    def _release_pool_slot(self, slot_index: int) -> None:
+        """Release a pool slot (keep the proc alive for warm reuse)."""
+        with _shared_proc_locks[slot_index]:
+            _shared_proc_busy[slot_index] = False
 
-            _shared_persistent_proc = proc
-            _shared_last_active = time.monotonic()
-            # Mirror to instance for backward compat (close() etc.)
-            self._persistent_proc = proc
-            logger.info("claude shared persistent proc started (pid=%s)", proc.pid)
-            return proc
+    def _ensure_persistent_process(self):
+        """Back-compat shim — delegates to the pool (slot 0).
 
-    def _persistent_send_and_recv(self, proc, prompt_text, timeout_seconds):
-        """Send a prompt to the persistent claude process and read the result."""
+        Kept so any legacy caller still using the single-process entry point
+        keeps working. Returns just the proc; slot tracking is not surfaced.
+        """
+        i, proc = self._acquire_pool_slot()
+        # Release immediately; legacy callers don't hold the slot contract.
+        # They get a live proc but are expected to be quick/single-threaded.
+        self._release_pool_slot(i)
+        return proc
+
+    def _persistent_send_and_recv(self, proc, prompt_text, timeout_seconds, slot_index: int = 0):
+        """Send a prompt to a pool slot's claude process and read the result."""
         request_line = json.dumps({
             "type": "user",
             "message": {
@@ -378,12 +442,14 @@ class ClaudeStreamJsonClient:
         proc.stdin.write(request_line + "\n")
         proc.stdin.flush()
         self._last_active = time.monotonic()
+        _shared_slot_last_active[slot_index] = self._last_active
 
         result_text = None
         deadline = time.monotonic() + timeout_seconds
         for raw_line in proc.stdout:
             if time.monotonic() > deadline:
-                logger.warning("claude persistent recv timed out after %.0fs", timeout_seconds)
+                logger.warning("claude pool slot %d recv timed out after %.0fs",
+                               slot_index, timeout_seconds)
                 break
             line = raw_line.strip()
             if not line:
@@ -397,62 +463,69 @@ class ClaudeStreamJsonClient:
                 result_text = event.get("result", "")
                 break
 
-        global _shared_last_active, _shared_call_count
-        _shared_last_active = time.monotonic()
-        self._last_active = _shared_last_active
+        now = time.monotonic()
+        _shared_slot_last_active[slot_index] = now
+        _shared_last_active = now  # aggregate for back-comat diagnostics
+        self._last_active = now
+        _shared_slot_call_count[slot_index] += 1
         _shared_call_count += 1
-        self._call_count = _shared_call_count
+        self._call_count = _shared_slot_call_count[slot_index]
 
         if result_text is not None:
-            logger.info("claude shared call #%d completed (pid=%s)",
-                        _shared_call_count, proc.pid)
+            logger.info("claude pool slot %d call #%d completed (pid=%s)",
+                        slot_index, _shared_slot_call_count[slot_index], proc.pid)
             return result_text
 
-        # Process may have died
-        global _shared_persistent_proc
+        # Process may have died — clear this slot so next acquire restarts it.
         if proc.poll() is not None:
-            logger.warning("claude shared proc exited (code=%s), will restart next call",
-                           proc.poll())
-            with _shared_persistent_lock:
-                _shared_persistent_proc = None
+            logger.warning("claude pool slot %d proc exited (code=%s), will restart next call",
+                           slot_index, proc.poll())
+            with _shared_proc_locks[slot_index]:
+                _shared_proc_pool[slot_index] = None
                 self._persistent_proc = None
 
         stderr_excerpt = "\n".join(stderr_tail[-15:])
         raise RuntimeError(
-            f"claude CLI persistent did not produce result. "
+            f"claude CLI pool slot {slot_index} did not produce result. "
             f"exit_code={proc.poll()} stderr_tail:\n{stderr_excerpt}"
         )
 
     def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> str:
-        """Spawn claude CLI, feed the prompt as one stream-json user message,
-        read stdout JSON lines until a `result` event arrives, return its text."""
-        # Build the single user-message JSON line per Claude stream-json protocol
-        request_line = json.dumps({
-            "type": "user",
-            "message": {
-                "role": "user",
-                "content": [{"type": "text", "text": prompt_text}],
-            },
-        })
+        """Acquire a pool slot, feed the prompt as one stream-json user message,
+        read stdout JSON lines until a `result` event arrives, return its text.
 
-        # P0-1: Use persistent process instead of one-shot subprocess
+        Parallel-safe: each concurrent caller gets its own slot's claude process
+        (independent stdin/stdout), so 2+ delegate_task calls run in parallel.
+        The slot is released in finally so it can never leak even on error.
+        """
+        slot_index = -1
         try:
-            proc = self._ensure_persistent_process()
-            return self._persistent_send_and_recv(proc, prompt_text, timeout_seconds)
+            slot_index, proc = self._acquire_pool_slot()
+            return self._persistent_send_and_recv(
+                proc, prompt_text, timeout_seconds, slot_index=slot_index)
         except RuntimeError:
-            # If persistent proc failed, force recycle and retry once
-            global _shared_persistent_proc
-            with _shared_persistent_lock:
-                if _shared_persistent_proc:
+            # The slot's proc failed. Release it (so the dead proc can be
+            # recycled on next acquire) and retry once on a fresh slot.
+            if slot_index >= 0:
+                # Force-clear the dead proc so the retry starts clean.
+                with _shared_proc_locks[slot_index]:
+                    dead = _shared_proc_pool[slot_index]
+                    _shared_proc_pool[slot_index] = None
+                    _shared_proc_busy[slot_index] = False
+                if dead is not None:
                     try:
-                        _shared_persistent_proc.kill()
+                        dead.kill()
                     except Exception:
                         pass
-                    _shared_persistent_proc = None
-                    self._persistent_proc = None
-            logger.warning("claude shared proc failed, retrying with fresh process")
-            proc = self._ensure_persistent_process()
-            return self._persistent_send_and_recv(proc, prompt_text, timeout_seconds)
+                self._persistent_proc = None
+                slot_index = -1
+            logger.warning("claude pool slot failed, retrying with fresh slot")
+            slot_index, proc = self._acquire_pool_slot()
+            return self._persistent_send_and_recv(
+                proc, prompt_text, timeout_seconds, slot_index=slot_index)
+        finally:
+            if slot_index >= 0:
+                self._release_pool_slot(slot_index)
 
 
 # ===== Module-level singleton for persistent claude process reuse =====
@@ -465,25 +538,63 @@ def get_shared_client(**kwargs) -> "ClaudeStreamJsonClient":
     """Get or create a shared ClaudeStreamJsonClient singleton.
 
     All delegate_task and dispatch_to_luban calls should use this instead of
-    creating a new ClaudeStreamJsonClient() directly. The singleton keeps the
-    persistent claude process alive across calls, avoiding 30-40s cold starts.
-
-    The persistent process auto-recycles after _idle_timeout (default 600s).
+    creating a new ClaudeStreamJsonClient() directly. The singleton keeps a
+    POOL of persistent claude processes alive across calls, avoiding 30-40s
+    cold starts, and lets 2+ concurrent delegate_task calls run in parallel
+    (one per pool slot) instead of serializing on a single subprocess.
     """
     global _singleton_client
     with _singleton_lock:
         if _singleton_client is None:
             _singleton_client = ClaudeStreamJsonClient(**kwargs)
-        # Note: we intentionally do NOT check is_closed here because close()
-        # no longer kills the persistent process — it only marks is_closed=True
-        # for one-shot cleanup. The shared persistent proc stays alive.
-            logger.info("Created shared ClaudeStreamJsonClient singleton (pid will start on first use)")
+            logger.info("Created shared ClaudeStreamJsonClient singleton "
+                        "(pool_size=%d, pids start on first use)", _pool_size)
         return _singleton_client
 
 
-# Module-level shared persistent process — all ClaudeStreamJsonClient instances
-# share the same claude process to avoid 30-40s cold starts on every call.
-_shared_persistent_proc: Optional[subprocess.Popen] = None
-_shared_persistent_lock = threading.Lock()
+# Module-level shared PROCESS POOL — all ClaudeStreamJsonClient instances
+# share N claude processes (default 3) so concurrent delegate_task calls run
+# in parallel instead of serializing on one subprocess stdin/stdout.
+# Each slot is an independent claude process with its own session id.
+# ponytail: list-of-slots with per-slot locks is enough at this concurrency
+# level; swap to a real worker queue only if pool_size grows large.
+try:
+    _pool_size = int(os.environ.get("HERMES_CLAUDE_POOL_SIZE", "3") or "3")
+except (TypeError, ValueError):
+    _pool_size = 3
+if _pool_size < 1:
+    _pool_size = 3
+
+_shared_proc_pool: List[Optional[subprocess.Popen]] = [None] * _pool_size
+_shared_proc_locks: List[threading.Lock] = [threading.Lock() for _ in range(_pool_size)]
+_shared_proc_busy: List[bool] = [False] * _pool_size
+_shared_slot_last_active: List[float] = [0.0] * _pool_size
+_shared_slot_call_count: List[int] = [0] * _pool_size
+
+# Aggregate counters kept for log continuity / back-compat diagnostics.
 _shared_last_active: float = 0.0
 _shared_call_count: int = 0
+
+# Back-compat alias: legacy single-process name still resolves (points at
+# pool[0] when populated). Old code that reads _shared_persistent_proc keeps
+# working; nothing new should read it.
+_shared_persistent_lock = _shared_proc_locks[0]  # legacy lock alias
+
+
+def _shared_persistent_proc_get() -> Optional[subprocess.Popen]:
+    """Legacy accessor — returns pool slot 0's proc, or None."""
+    return _shared_proc_pool[0] if _shared_proc_pool else None
+
+
+# Expose the legacy name as a module-level property-like object so bare
+# `_shared_persistent_proc` reads (in any stale code path) don't NameError.
+# It is a thin shim; writes go through _shared_persistent_proc_set().
+class _SharedProcShim:
+    def __bool__(self):
+        return _shared_proc_pool and _shared_proc_pool[0] is not None
+
+    def __repr__(self):
+        return f"<_SharedProcShim pool[0]={_shared_proc_pool[0]!r}>"
+
+
+_shared_persistent_proc = _SharedProcShim()
