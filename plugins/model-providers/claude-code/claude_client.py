@@ -441,7 +441,7 @@ class ClaudeStreamJsonClient:
 
     def _persistent_send_and_recv(self, proc, prompt_text, timeout_seconds, slot_index: int = 0):
         """Send a prompt to a pool slot's claude process and read the result."""
-        global _shared_call_count
+        global _shared_call_count, _shared_last_active
         request_line = json.dumps({
             "type": "user",
             "message": {
