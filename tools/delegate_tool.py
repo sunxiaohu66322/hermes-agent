@@ -43,6 +43,19 @@ from tools.terminal_tool import set_approval_callback as _set_subagent_approval_
 from utils import base_url_hostname, is_truthy_value
 
 
+def _notify_agent_channel(from_agent: str, to_agent: str, message: str):
+    """Post a status message to the Agent Channel message board (fire-and-forget)."""
+    try:
+        import subprocess as _sp
+        _sp.Popen(
+            ["python3", "/mnt/j/SimonApp/AI-Workspace/active/20260801_agent_channel/agent_channel.py",
+             "post", "--from", from_agent, "--to", to_agent, "--msg", message[:200]],
+            stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+        )
+    except Exception:
+        pass  # fire-and-forget, never block delegate_task
+
+
 # Tools that children must never have access to
 DELEGATE_BLOCKED_TOOLS = frozenset(
     [
@@ -2899,6 +2912,12 @@ def delegate_task(
         }
         if live_paths:
             combined["live_transcripts"] = list(live_paths)
+        # Notify Agent Channel dashboard of completion
+        try:
+            _done_goal = task_list[0]["goal"] if task_list else "batch"
+            _notify_agent_channel("luban", "hermes", f"任务完成: {_done_goal[:100]}")
+        except Exception:
+            pass
         return combined
 
     # ----- Background dispatch: run the WHOLE batch as one async unit -----
@@ -3028,6 +3047,9 @@ def delegate_task(
 
         if dispatch.get("status") == "dispatched":
             n = len(_goals)
+            # Notify Agent Channel dashboard
+            _to_agent = "luban" if "luban" in str(creds.get("provider", "")) else "mogong" if "mogong" in str(creds.get("provider", "")) else "subagent"
+            _notify_agent_channel("hermes", _to_agent, f"任务派发: {_goals[0][:100] if _goals else 'batch'} ({n}个任务)")
             note = (
                 "Subagent is running in the background. You and the user can "
                 "keep working; its full result re-enters the conversation as a "

@@ -441,6 +441,7 @@ class ClaudeStreamJsonClient:
 
     def _persistent_send_and_recv(self, proc, prompt_text, timeout_seconds, slot_index: int = 0):
         """Send a prompt to a pool slot's claude process and read the result."""
+        global _shared_call_count
         request_line = json.dumps({
             "type": "user",
             "message": {
@@ -574,29 +575,6 @@ def get_shared_client(**kwargs) -> "ClaudeStreamJsonClient":
                         "(pool_size=%d, pids start on first use)", _pool_size)
         return _singleton_client
 
-
-# Module-level shared PROCESS POOL — all ClaudeStreamJsonClient instances
-# share N claude processes (default 3) so concurrent delegate_task calls run
-# in parallel instead of serializing on one subprocess stdin/stdout.
-# Each slot is an independent claude process with its own session id.
-# ponytail: list-of-slots with per-slot locks is enough at this concurrency
-# level; swap to a real worker queue only if pool_size grows large.
-try:
-    _pool_size = int(os.environ.get("HERMES_CLAUDE_POOL_SIZE", "8") or "8")
-except (TypeError, ValueError):
-    _pool_size = 8
-if _pool_size < 1:
-    _pool_size = 8
-
-_shared_proc_pool: List[Optional[subprocess.Popen]] = [None] * _pool_size
-_shared_proc_locks: List[threading.Lock] = [threading.Lock() for _ in range(_pool_size)]
-_shared_proc_busy: List[bool] = [False] * _pool_size
-_shared_slot_last_active: List[float] = [0.0] * _pool_size
-_shared_slot_call_count: List[int] = [0] * _pool_size
-
-# Aggregate counters kept for log continuity / back-compat diagnostics.
-_shared_last_active: float = 0.0
-_shared_call_count: int = 0
 
 # Back-compat alias: legacy single-process name still resolves (points at
 # pool[0] when populated). Old code that reads _shared_persistent_proc keeps
