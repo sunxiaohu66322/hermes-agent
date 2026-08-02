@@ -441,7 +441,7 @@ class ClaudeStreamJsonClient:
 
     def _persistent_send_and_recv(self, proc, prompt_text, timeout_seconds, slot_index: int = 0):
         """Send a prompt to a pool slot's claude process and read the result."""
-        global _shared_call_count, _shared_last_active
+        global _shared_last_active
         request_line = json.dumps({
             "type": "user",
             "message": {
@@ -492,7 +492,6 @@ class ClaudeStreamJsonClient:
         _shared_last_active = now  # aggregate for back-comat diagnostics
         self._last_active = now
         _shared_slot_call_count[slot_index] += 1
-        _shared_call_count += 1
         self._call_count = _shared_slot_call_count[slot_index]
 
         if result_text is not None:
