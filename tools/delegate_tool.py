@@ -43,17 +43,39 @@ from tools.terminal_tool import set_approval_callback as _set_subagent_approval_
 from utils import base_url_hostname, is_truthy_value
 
 
+_AGENT_CHANNEL_SCRIPT = "/mnt/j/SimonApp/AI-Workspace/active/20260801_agent_channel/agent_channel.py"
+
+# Track which agent was dispatched, so completion notice uses the right name.
+# key = delegation_id, value = agent name ("luban" / "mogong" / "subagent")
+_DELEGATION_AGENTS: Dict[str, str] = {}
+
+
 def _notify_agent_channel(from_agent: str, to_agent: str, message: str):
     """Post a status message to the Agent Channel message board (fire-and-forget)."""
     try:
         import subprocess as _sp
         _sp.Popen(
-            ["python3", "/mnt/j/SimonApp/AI-Workspace/active/20260801_agent_channel/agent_channel.py",
+            ["python3", _AGENT_CHANNEL_SCRIPT,
              "post", "--from", from_agent, "--to", to_agent, "--msg", message[:200]],
             stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
         )
     except Exception:
         pass  # fire-and-forget, never block delegate_task
+
+
+def _agent_from_creds(creds) -> str:
+    """Map a delegation's credential provider to the Agent Channel agent name.
+
+    luban   = Claude Code, mogong = Codex, else the generic 'subagent'.
+    Used for BOTH dispatch and completion notices so the from_agent on
+    completion matches who actually did the work (was hardcoded 'luban').
+    """
+    provider = str(creds.get("provider", "")) if creds else ""
+    if "luban" in provider:
+        return "luban"
+    if "mogong" in provider:
+        return "mogong"
+    return "subagent"
 
 
 # Tools that children must never have access to
@@ -2915,7 +2937,8 @@ def delegate_task(
         # Notify Agent Channel dashboard of completion
         try:
             _done_goal = task_list[0]["goal"] if task_list else "batch"
-            _notify_agent_channel("luban", "hermes", f"任务完成: {_done_goal[:100]}")
+            _done_agent = _DELEGATION_AGENTS.pop(live_deleg_id, "luban")
+            _notify_agent_channel(_done_agent, "hermes", f"任务完成: {_done_goal[:100]}")
         except Exception:
             pass
         return combined
@@ -3048,7 +3071,14 @@ def delegate_task(
         if dispatch.get("status") == "dispatched":
             n = len(_goals)
             # Notify Agent Channel dashboard
-            _to_agent = "luban" if "luban" in str(creds.get("provider", "")) else "mogong" if "mogong" in str(creds.get("provider", "")) else "subagent"
+            _p = str(creds.get("provider", ""))
+            if "luban" in _p:
+                _to_agent = "luban"
+            elif "mogong" in _p:
+                _to_agent = "mogong"
+            else:
+                _to_agent = "developer_main"  # general-purpose subagent
+            _DELEGATION_AGENTS[live_deleg_id] = _to_agent
             _notify_agent_channel("hermes", _to_agent, f"任务派发: {_goals[0][:100] if _goals else 'batch'} ({n}个任务)")
             note = (
                 "Subagent is running in the background. You and the user can "
@@ -3217,22 +3247,28 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent, goal: Optional[str]
 
     # Keyword-based provider routing: when no explicit provider is configured
     # (or it's the generic 'custom'), infer the provider from the delegated
-    # goal so code-editing tasks land on 'luban' and setup/deploy tasks on
-    # 'mogong' without requiring the caller to set delegation.provider.
+    # goal. Routes to the best-matching agent based on task content.
+    #
+    # Routing table (from config strengths + skill definitions):
+    #   luban  (Claude Code): code writing, scripts, architecture, reverse eng
+    #   mogong (Codex):       execution, patch, testing, deploy, GUI ops, ops
+    #   custom (general leaf): research, docs, analysis, non-code tasks
     if configured_provider in (None, "custom") and goal:
         _goal_lower = goal.lower()
-        _has_code_action = bool(re.search(r"写|改|修|bug|fix|refactor", _goal_lower))
-        _has_code_ext = bool(re.search(r"\.(py|js|ts)\b", _goal_lower))
-        if _has_code_action and _has_code_ext:
+        _has_code_action = bool(re.search(r"写|改|修|bug|fix|refactor|创建.*文件|实现", _goal_lower))
+        _has_code_ext = bool(re.search(r"\.(py|js|ts|sh|jsx|tsx|go|rs|java|vue)\b", _goal_lower))
+        _has_arch = bool(re.search(r"架构|design|重构|refactor|逆向|reverse", _goal_lower))
+        _has_deploy = bool(re.search(r"安装|部署|配置|install|deploy|config|systemctl|docker|nginx", _goal_lower))
+        _has_ops = bool(re.search(r"测试|test|patch|执行|execute|运行|run|GUI|操作", _goal_lower))
+        _has_research = bool(re.search(r"调研|research|搜索|search|分析|analyze|文档|doc|readme", _goal_lower))
+
+        if (_has_code_action and (_has_code_ext or _has_arch)) or _has_arch:
             configured_provider = "luban"
-            logger.info(
-                "delegation credential route: goal matched code-edit keywords -> provider='luban'"
-            )
-        elif re.search(r"安装|部署|配置|install|deploy|config", _goal_lower):
+            logger.info("delegation route: code/architecture -> provider='luban'")
+        elif _has_deploy or _has_ops:
             configured_provider = "mogong"
-            logger.info(
-                "delegation credential route: goal matched setup/deploy keywords -> provider='mogong'"
-            )
+            logger.info("delegation route: deploy/ops/test -> provider='mogong'")
+        # else: stays as 'custom' = general-purpose leaf agent
 
     # Native-SDK providers (Bedrock, Vertex, Google GenAI) speak their own
     # wire protocol — they cannot be reached via OpenAI chat_completions against
