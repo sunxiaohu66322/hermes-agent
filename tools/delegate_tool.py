@@ -2966,6 +2966,14 @@ def delegate_task(
     # subagent-lifecycle API).
     children = []
     for i, t in enumerate(task_list):
+        # Notify Agent Channel dashboard of batch dispatch
+        try:
+            _first_goal = task_list[0].get("goal", "") if task_list else ""
+            _dispatch_agent = _agent_from_creds({"provider": creds.get("provider", "")})
+            _notify_agent_channel("hermes", _dispatch_agent, f"dispatch batch ({n_tasks} tasks): {_first_goal[:80]}")
+        except Exception:
+            pass
+
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
@@ -3180,6 +3188,13 @@ def delegate_task(
         }
         if live_paths:
             combined["live_transcripts"] = list(live_paths)
+        # Notify Agent Channel dashboard of completion
+        try:
+            _done_goal = task_list[0].get("goal", "") if task_list else ""
+            _agent_name = _agent_from_creds({"provider": creds.get("provider", "")})
+            _notify_agent_channel(_agent_name, "hermes", f"task complete: {_done_goal[:100]}")
+        except Exception:
+            pass
         return combined
 
     # ----- Background dispatch: run the WHOLE batch as one async unit -----
@@ -3530,6 +3545,26 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     configured_base_url = str(cfg.get("base_url") or "").strip() or None
     configured_api_key = str(cfg.get("api_key") or "").strip() or None
     configured_api_mode = str(cfg.get("api_mode") or "").strip().lower() or None
+
+    # Smart routing: keyword-based provider selection for luban/mogong.
+    # When delegation.provider is not explicitly set, auto-detect from goal keywords.
+    # Code-edit tasks (写/改/修/bug/fix/refactor + .py/.js/.ts) -> luban (Claude Code)
+    # Setup/deploy tasks (安装/部署/配置/install/deploy/config) -> mogong (Codex CLI)
+    # This enables automatic dispatch without manual provider selection.
+    _goal_lower = (goal or "").lower()
+    if not configured_provider:
+        _has_code_action = bool(re.search(r"写|改|修|bug|fix|refactor", _goal_lower))
+        _has_code_ext = bool(re.search(r"\.(py|js|ts)\b", _goal_lower))
+        if _has_code_action and _has_code_ext:
+            configured_provider = "luban"
+            logger.info(
+                "delegation credential route: goal matched code-edit keywords -> provider='luban'"
+            )
+        elif re.search(r"安装|部署|配置|install|deploy|config", _goal_lower):
+            configured_provider = "mogong"
+            logger.info(
+                "delegation credential route: goal matched setup/deploy keywords -> provider='mogong'"
+            )
 
     # Native-SDK providers (Bedrock, Vertex, Google GenAI) speak their own
     # wire protocol — they cannot be reached via OpenAI chat_completions against

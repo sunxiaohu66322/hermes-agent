@@ -1,0 +1,5 @@
+name: claude-code-provider
+kind: model-provider
+version: 1.0.0
+description: Claude Code CLI via stream-json subprocess (鲁班 transport)
+author: 鲁班

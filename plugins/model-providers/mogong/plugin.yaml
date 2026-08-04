@@ -1,0 +1,5 @@
+name: mogong-provider
+kind: model-provider
+version: 1.0.0
+description: Codex CLI via exec --json subprocess (墨工 transport)
+author: 鲁班
