@@ -237,7 +237,7 @@ class ClaudeStreamJsonClient:
         self._active_process: Optional[subprocess.Popen] = None
         self._active_process_lock = threading.Lock()
         self._persistent_lock = self._active_process_lock  # alias for backward compat
-        self._idle_timeout = 86400.0  # 24h persistent proc idle timeout (was 600s)
+        self._idle_timeout = 600.0  # DeepSeek fix: 24h too long, 600s + health check
 
     def close(self) -> None:
         """Close one-shot process and clean up the shared process pool.
