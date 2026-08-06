@@ -24,6 +24,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 import os
+import re
 import threading
 import time
 from concurrent.futures import (
@@ -2886,7 +2887,7 @@ def delegate_task(
     # used by CLI/gateway startup.  When unconfigured, returns None values so
     # children inherit from the parent.
     try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
+        creds = _resolve_delegation_credentials(cfg, parent_agent, goal)
     except ValueError as exc:
         return tool_error(str(exc))
 
@@ -3519,7 +3520,7 @@ def _resolve_child_credential_pool(
     return None
 
 
-def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
+def _resolve_delegation_credentials(cfg: dict, parent_agent, goal: Optional[str] = None) -> dict:
     """Resolve credentials for subagent delegation.
 
     If ``delegation.base_url`` is configured, subagents use that direct
@@ -3546,25 +3547,30 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     configured_api_key = str(cfg.get("api_key") or "").strip() or None
     configured_api_mode = str(cfg.get("api_mode") or "").strip().lower() or None
 
-    # Smart routing: keyword-based provider selection for luban/mogong.
-    # When delegation.provider is not explicitly set, auto-detect from goal keywords.
-    # Code-edit tasks (写/改/修/bug/fix/refactor + .py/.js/.ts) -> luban (Claude Code)
-    # Setup/deploy tasks (安装/部署/配置/install/deploy/config) -> mogong (Codex CLI)
-    # This enables automatic dispatch without manual provider selection.
-    _goal_lower = (goal or "").lower()
-    if not configured_provider:
-        _has_code_action = bool(re.search(r"写|改|修|bug|fix|refactor", _goal_lower))
-        _has_code_ext = bool(re.search(r"\.(py|js|ts)\b", _goal_lower))
-        if _has_code_action and _has_code_ext:
+    # Keyword-based provider routing: when no explicit provider is configured
+    # (or it's the generic 'custom'), infer the provider from the delegated
+    # goal. Routes to the best-matching agent based on task content.
+    #
+    # Routing table (from config strengths + skill definitions):
+    #   luban  (Claude Code): code writing, scripts, architecture, reverse eng
+    #   mogong (Codex):       execution, patch, testing, deploy, GUI ops, ops
+    #   custom (general leaf): research, docs, analysis, non-code tasks
+    if configured_provider in (None, "custom") and goal:
+        _goal_lower = goal.lower()
+        _has_code_action = bool(re.search(r"编写|写代码|写脚本|改代码|修bug|修复|bug|fix|refactor|创建.*文件|创建.*脚本|新建.*文件|实现", _goal_lower))
+        _has_code_ext = bool(re.search(r"\.(py|js|ts|sh|jsx|tsx|go|rs|java|vue)(?:\s|$|[^a-zA-Z])", _goal_lower))
+        _has_arch = bool(re.search(r"架构|design|重构|refactor|逆向|reverse", _goal_lower))
+        _has_deploy = bool(re.search(r"安装|部署|配置|install|deploy|config|systemctl|docker|nginx", _goal_lower))
+        _has_ops = bool(re.search(r"测试|test|patch|执行|execute|运行|run|GUI|操作", _goal_lower))
+        _has_research = bool(re.search(r"调研|research|搜索|search|分析|analyze|文档|doc|readme", _goal_lower))
+
+        if (_has_code_action and (_has_code_ext or _has_arch)) or _has_arch:
             configured_provider = "luban"
-            logger.info(
-                "delegation credential route: goal matched code-edit keywords -> provider='luban'"
-            )
-        elif re.search(r"安装|部署|配置|install|deploy|config", _goal_lower):
+            logger.info("delegation route: code/architecture -> provider='luban'")
+        elif _has_deploy or _has_ops:
             configured_provider = "mogong"
-            logger.info(
-                "delegation credential route: goal matched setup/deploy keywords -> provider='mogong'"
-            )
+            logger.info("delegation route: deploy/ops/test -> provider='mogong'")
+        # else: stays as 'custom' = general-purpose leaf agent
 
     # Native-SDK providers (Bedrock, Vertex, Google GenAI) speak their own
     # wire protocol — they cannot be reached via OpenAI chat_completions against
