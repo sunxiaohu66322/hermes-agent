@@ -108,6 +108,23 @@ def _build_subprocess_env() -> dict[str, str]:
     env["HOME"] = home
     from hermes_constants import apply_subprocess_home_env
     apply_subprocess_home_env(env)
+    # Inject ANTHROPIC env vars from ~/.claude/settings.json if present.
+    # Claude Code reads settings.json on startup, but ACP subprocess may not
+    # inherit the parent's env. This ensures luban provider connects to the
+    # configured proxy (e.g. http://192.168.0.101:15722) instead of direct
+    # api.anthropic.com.
+    try:
+        import json as _json, os as _os
+        _settings_path = _os.path.join(home, ".claude", "settings.json")
+        if _os.path.exists(_settings_path):
+            with open(_settings_path) as _f:
+                _settings = _json.load(_f)
+            _claude_env = _settings.get("env", {})
+            for _k, _v in _claude_env.items():
+                if _k.startswith("ANTHROPIC_") or _k.startswith("CLAUDE_"):
+                    env[_k] = str(_v)
+    except Exception:
+        pass
     return env
 
 
