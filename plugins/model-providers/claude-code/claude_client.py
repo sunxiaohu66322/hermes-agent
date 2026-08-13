@@ -237,14 +237,11 @@ class ClaudeStreamJsonClient:
         self._active_process: Optional[subprocess.Popen] = None
         self._active_process_lock = threading.Lock()
         self._persistent_lock = self._active_process_lock  # alias for backward compat
-        self._idle_timeout = 600.0  # DeepSeek fix: 24h too long, 600s + health check
+        self._idle_timeout = 2592000.0  # 30 days — keep pool processes alive across reboots
 
     def close(self) -> None:
-        """Close one-shot process and clean up the shared process pool.
-
-        Tears down ALL slots in the module-level _shared_proc_pool so the
-        singleton (and any parallel callers) release their claude processes
-        on shutdown. Each slot is terminated gently then killed.
+        """Close one-shot process only. Do NOT tear down the shared pool.
+        Pool processes are kept alive for reuse. Recycled by idle_timeout or close_all().
         """
         proc: Optional[subprocess.Popen]
         with self._active_process_lock:
@@ -259,9 +256,14 @@ class ClaudeStreamJsonClient:
                     proc.kill()
                 except Exception:
                     pass
+        slot = getattr(self, "_active_slot", -1)
+        if slot >= 0:
+            _shared_proc_busy[slot] = False
+            logger.debug("claude pool slot %d released (pid=%s, kept alive)",
+                         slot, getattr(_shared_proc_pool[slot], "pid", "?"))
 
-        # Tear down every pool slot. Each slot has its own lock; we take them
-        # in order and clear busy + proc. Don't hold the singleton alive.
+    def close_all(self) -> None:
+        """Tear down ALL pool slots. Only call on gateway shutdown."""
         for i in range(_pool_size):
             with _shared_proc_locks[i]:
                 _shared_proc_busy[i] = False

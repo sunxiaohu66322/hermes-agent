@@ -5445,6 +5445,17 @@ def run_conversation(
                         agent._dump_api_request_debug(
                             api_kwargs, reason="max_retries_exhausted", error=api_error,
                         )
+                    # Save partial streamed content before persisting (mirrors
+                    # the InterruptedError path at ~L3490). Without this, a
+                    # long reasoning response that dies on the last retry
+                    # loses ALL generated text — the user's core complaint.
+                    _partial = agent._strip_think_blocks(
+                        getattr(agent, "_current_streamed_assistant_text", "") or ""
+                    ).strip()
+                    if _partial:
+                        messages.append({"role": "assistant", "content": _partial})
+                        if not final_response or final_response == _final_summary:
+                            final_response = _partial
                     agent._persist_session(messages, conversation_history)
                     _billing_block = None
                     if classified.reason == FailoverReason.billing:
@@ -5515,6 +5526,14 @@ def run_conversation(
                             except (TypeError, ValueError):
                                 pass
                 wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+                # v3 patch (2026-08-10): 当代理返回 "upstream model temporarily unavailable, waited Ns"
+                # 说明代理侧已等待很久（model_loss恢复超时），此时指数退避到60s只会让用户等更久。
+                # 代理有降级链，重试时代理会自动切换到不同模型，所以用固定短间隔(5s)快速重试。
+                _err_summary = str(getattr(api_error, "message", "") or api_error or "")
+                if "waited" in _err_summary and "unavailable" in _err_summary:
+                    wait_time = 5.0
+                    _backoff_policy = "proxy_model_loss_fast_retry"
+                    logger.info("Proxy model-loss detected, using fast 5s retry (attempt %s/%s)", retry_count, max_retries)
                 _backoff_policy = None
                 if (is_rate_limited or _is_zai_coding_overload) and not _retry_after:
                     wait_time, _backoff_policy = adaptive_rate_limit_backoff(

@@ -73,6 +73,17 @@ _REASONING_STALE_TIMEOUT_FLOORS: tuple[tuple[str, int], ...] = (
     ("deepseek-reasoner", 600),
     ("deepseek-v4-flash", 600),
     ("deepseek-v4-pro", 600),
+    # Xunfei (讯飞) reasoning models via Xunfei MaaS proxy.
+    # These emit extended thinking blocks; the Xunfei proxy's stream idle
+    # timeout kills the connection during the thinking phase. Floor raised
+    # to 900s for top-tier models, 600s for mid-tier.
+    ("xopglm52", 900),
+    ("xopglm51", 600),
+    ("xopdeepseekv4pro", 900),
+    ("xopdeepseekv4flash", 600),
+    ("xopkimi27code", 600),
+    ("xopkimik26", 600),
+    ("xopkimik25", 600),
     # Qwen — QwQ reasoning + Qwen3 thinking variants.  QwQ-32B
     # preview is the stable slug; ``qwen3`` covers the family of
     # thinking-mode Qwen3 models (qwen3-235b-a22b, qwen3-32b, etc.)

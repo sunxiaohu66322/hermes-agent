@@ -6311,14 +6311,60 @@ def resolve_provider_client(
                 else (client, final_model))
 
     if pconfig.auth_type == "external_process":
-        creds = resolve_external_process_provider_credentials(provider)
         final_model = _normalize_resolved_model(
             model
             or (main_runtime.get("model") if main_runtime else None)
             or _read_main_model_for_aux(),
             provider,
         )
+        # Luban/mogong have their own credential resolution via
+        # resolve_runtime_provider — must be checked BEFORE the generic
+        # resolve_external_process_provider_credentials() which is hardcoded
+        # to the Copilot CLI and raises AuthError for non-copilot providers.
+        if provider in ("luban", "mogong"):
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+            try:
+                creds = resolve_runtime_provider(requested=provider, target_model=model)
+            except Exception as exc:
+                logger.warning(
+                    "resolve_provider_client: %s credential resolution failed: %s", provider, exc
+                )
+                return None, None
+            if not final_model:
+                logger.warning(
+                    "resolve_provider_client: %s requested but no model "
+                    "was provided or configured", provider
+                )
+                return None, None
+            command = str(creds.get("command", "")).strip() or None
+            args = list(creds.get("args") or [])
+            if not command:
+                logger.warning(
+                    "resolve_provider_client: %s requested but CLI "
+                    "command not resolved", provider
+                )
+                return None, None
+            if provider == "luban":
+                from plugins.model_providers.claude_code.claude_client import ClaudeStreamJsonClient
+                client = ClaudeStreamJsonClient(
+                    api_key="luban",
+                    base_url=str(creds.get("base_url", "acp://claude-code")),
+                    command=command,
+                    args=args,
+                )
+            else:  # mogong
+                from plugins.model_providers.mogong.codex_client import CodexStreamJsonClient
+                client = CodexStreamJsonClient(
+                    api_key="mogong",
+                    base_url=str(creds.get("base_url", "acp://codex")),
+                    command=command,
+                    args=args,
+                )
+            logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
+            return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                    else (client, final_model))
         if provider == "copilot-acp":
+            creds = resolve_external_process_provider_credentials(provider)
             api_key = str(creds.get("api_key", "")).strip()
             base_url = str(creds.get("base_url", "")).strip()
             command = str(creds.get("command", "")).strip() or None

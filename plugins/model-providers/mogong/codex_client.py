@@ -176,7 +176,7 @@ class CodexStreamJsonClient:
         self._persistent_proc = None
         self._last_active = 0.0
         self._call_count = 0
-        self._idle_timeout = float(os.environ.get("CODEX_IDLE_TIMEOUT", "600"))
+        self._idle_timeout = float(os.environ.get("CODEX_IDLE_TIMEOUT", "2592000"))  # 30 days
         self._persistent_lock = self._active_process_lock  # alias
 
     def close(self) -> None:
@@ -351,24 +351,94 @@ class CodexStreamJsonClient:
         )
 
     def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> str:
-        """Spawn codex exec, feed prompt on stdin, read JSONL until item.completed."""
-        # P0-1: Use persistent process instead of one-shot subprocess
+        """Spawn codex exec as ONE-SHOT subprocess, feed prompt on stdin (with EOF),
+        read JSONL until item.completed.
+
+        Unlike Claude's --print stream-json mode which keeps the process alive,
+        codex exec is inherently one-shot: it reads stdin until EOF, processes,
+        outputs JSONL to stdout, then exits. A persistent-process approach that
+        doesn't close stdin will hang forever because codex waits for EOF.
+        """
+        stderr_tail: List[str] = []
+
         try:
-            proc = self._ensure_persistent_process()
-            return self._persistent_send_and_recv(proc, prompt_text, timeout_seconds)
-        except RuntimeError:
-            global _shared_persistent_proc
-            with _shared_persistent_lock:
-                if _shared_persistent_proc:
-                    try:
-                        _shared_persistent_proc.kill()
-                    except Exception:
-                        pass
-                    _shared_persistent_proc = None
-                    self._persistent_proc = None
-            logger.warning("codex shared proc failed, retrying with fresh process")
-            proc = self._ensure_persistent_process()
-            return self._persistent_send_and_recv(proc, prompt_text, timeout_seconds)
+            proc = subprocess.Popen(
+                [self._command] + self._args,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                cwd=self._cwd,
+                env=_build_subprocess_env(),
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"Could not start codex CLI command '{self._command}'. "
+                "Install Codex CLI or set HERMES_CODEX_COMMAND."
+            ) from exc
+
+        self._active_process = proc
+        self._last_active = time.monotonic()
+
+        def _stderr_reader():
+            if proc.stderr is None:
+                return
+            for line in proc.stderr:
+                stderr_tail.append(line.rstrip("\n"))
+
+        err_thread = threading.Thread(target=_stderr_reader, daemon=True)
+        err_thread.start()
+
+        # Write prompt and CLOSE stdin (EOF) — codex exec needs EOF to start processing
+        try:
+            proc.stdin.write(prompt_text + "\n")
+            proc.stdin.flush()
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass  # proc may have exited already
+
+        result_text = None
+        deadline = time.monotonic() + timeout_seconds
+        for raw_line in proc.stdout:
+            if time.monotonic() > deadline:
+                logger.warning("codex exec timed out after %.0fs", timeout_seconds)
+                break
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except Exception:
+                continue
+            etype = event.get("type")
+            if etype == "item.completed":
+                item = event.get("item") or {}
+                if item.get("type") == "agent_message":
+                    result_text = item.get("text", "")
+                    break
+
+        # Reap the process
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+        self._call_count += 1
+        self._last_active = time.monotonic()
+
+        if result_text is not None:
+            logger.info("codex exec call #%d completed (pid=%s)", self._call_count, proc.pid)
+            return result_text
+
+        stderr_excerpt = "\n".join(stderr_tail[-15:])
+        raise RuntimeError(
+            f"codex CLI did not produce agent_message. "
+            f"exit_code={proc.poll()} stderr_tail:\n{stderr_excerpt}"
+        )
 
 # ===== Module-level shared persistent process for codex reuse =====
 

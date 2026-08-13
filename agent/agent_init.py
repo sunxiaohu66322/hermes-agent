@@ -1145,9 +1145,11 @@ def init_agent(
             _gr_label = " + Guardrails" if agent._bedrock_guardrail_config else ""
             print(f"🤖 AI Agent initialized with model: {agent.model} (AWS Bedrock, {agent._bedrock_region}{_gr_label})")
     else:
-        if api_key and base_url:
+        if api_key and base_url and not str(base_url).startswith("acp://"):
             # Explicit credentials from CLI/gateway — construct directly.
             # The runtime provider resolver already handled auth for us.
+            # acp:// providers (luban/mogong/copilot) are handled via
+            # resolve_provider_client below (auth_type=external_process).
             # Extract query params (e.g. Azure api-version) from base_url
             # and pass via default_query to prevent loss during SDK URL
             # joining (httpx drops query string when joining paths).
@@ -1703,6 +1705,7 @@ def init_agent(
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
                 agent._memory_manager = _MemoryManager()
+                agent._memory_manager.configure_burst_buffer(mem_config)
                 _mp = _load_mem(_mem_provider_name)
                 if _mp and _mp.is_available():
                     agent._memory_manager.add_provider(_mp)

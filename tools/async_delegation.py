@@ -107,8 +107,8 @@ _DB_LOCK = threading.Lock()
 # call is caught quickly; in-tool is much higher so legitimately slow tools
 # (long terminal commands, big fetches) get time to finish.
 _STALE_CHECK_INTERVAL = 30.0  # seconds between monitor sweeps
-_STALE_IDLE_SECONDS = 450.0  # no progress, no current tool → stalled
-_STALE_IN_TOOL_SECONDS = 1200.0  # no progress while inside a tool → stalled
+_STALE_IDLE_SECONDS = 1800.0  # match child_timeout — claude API can take 600s+ on long prompts
+_STALE_IN_TOOL_SECONDS = 1800.0  # no progress while inside a tool → stalled
 _STALL_GRACE_SECONDS = 120.0  # after interrupt, time for the runner to return
 
 _monitor_lock = threading.Lock()

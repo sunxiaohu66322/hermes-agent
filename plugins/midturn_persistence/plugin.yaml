@@ -1,0 +1,7 @@
+name: midturn-persistence
+version: 1.0
+description: Mid-turn streaming response persistence — survives API disconnects
+hooks:
+  - pre_api_request
+  - post_api_response
+  - stream_delta

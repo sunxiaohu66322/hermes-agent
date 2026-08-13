@@ -2259,6 +2259,32 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
             agent._client_log_context(),
         )
         return client
+    if agent.provider == "luban" or str(client_kwargs.get("base_url", "")).startswith("acp://claude-code"):
+        from plugins.model_providers.claude_code.claude_client import get_shared_client
+        client = get_shared_client(
+            api_key=client_kwargs.get("api_key", "luban"),
+            base_url=client_kwargs.get("base_url", "acp://claude-code"),
+        )
+        _ra().logger.info(
+            "Claude Code (luban) client created (%s, shared=%s) %s",
+            reason,
+            shared,
+            agent._client_log_context(),
+        )
+        return client
+    if agent.provider == "mogong" or str(client_kwargs.get("base_url", "")).startswith("acp://codex"):
+        from plugins.model_providers.mogong.codex_client import get_shared_client as get_codex_client
+        client = get_codex_client(
+            api_key=client_kwargs.get("api_key", "mogong"),
+            base_url=client_kwargs.get("base_url", "acp://codex"),
+        )
+        _ra().logger.info(
+            "Codex (mogong) client created (%s, shared=%s) %s",
+            reason,
+            shared,
+            agent._client_log_context(),
+        )
+        return client
     if agent.provider == "gemini":
         from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
 

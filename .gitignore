@@ -194,3 +194,17 @@ native/fts5_cjk/*.so
 # interrupted; consumed by launch-time recovery. Never commit it (was tracked
 # by accident via 3a69e34702, removed in the #72002 salvage).
 .lazy-refresh-incomplete
+
+agent/agent_runtime_helpers.py.bak.luban-routing-20260811
+
+agent/conversation_loop.py.bak-retry-fix-20260810
+
+plugins/model-providers/mogong/codex_client.py.bak-persistent-fix-20260811
+
+tools/async_delegation.py.bak
+
+tools/delegate_tool.py.bak-rebase-patch-20260810
+
+tools/delegate_tool.py.bak.20260809_luban_mogong_acp_fix
+
+tools/delegate_tool.py.bak.20260810

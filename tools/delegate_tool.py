@@ -3548,21 +3548,19 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent, goal: Optional[str]
     configured_api_mode = str(cfg.get("api_mode") or "").strip().lower() or None
 
     # Keyword-based provider routing: when no explicit provider is configured
-    # (or it's the generic 'custom'), infer the provider from the delegated
-    # goal. Routes to the best-matching agent based on task content.
-    #
-    # Routing table (from config strengths + skill definitions):
-    #   luban  (Claude Code): code writing, scripts, architecture, reverse eng
-    #   mogong (Codex):       execution, patch, testing, deploy, GUI ops, ops
-    #   custom (general leaf): research, docs, analysis, non-code tasks
-    if configured_provider in (None, "custom") and goal:
+    # (None), infer the provider from the delegated goal.
+    # When delegation.provider == "custom" is explicitly set in config, the
+    # user wants all leaf subagents to use the custom_providers endpoint
+    # (e.g. xfyun proxy). Keyword routing must NOT override this.
+    # v3.1 patch (2026-08-10): fix keyword routing hijacking 'custom' provider
+    # to mogong/luban, causing Connection error to acp://codex.
+    if configured_provider is None and goal:
         _goal_lower = goal.lower()
         _has_code_action = bool(re.search(r"编写|写代码|写脚本|改代码|修bug|修复|bug|fix|refactor|创建.*文件|创建.*脚本|新建.*文件|实现", _goal_lower))
         _has_code_ext = bool(re.search(r"\.(py|js|ts|sh|jsx|tsx|go|rs|java|vue)(?:\s|$|[^a-zA-Z])", _goal_lower))
         _has_arch = bool(re.search(r"架构|design|重构|refactor|逆向|reverse", _goal_lower))
         _has_deploy = bool(re.search(r"安装|部署|配置|install|deploy|config|systemctl|docker|nginx", _goal_lower))
         _has_ops = bool(re.search(r"测试|test|patch|执行|execute|运行|run|GUI|操作", _goal_lower))
-        _has_research = bool(re.search(r"调研|research|搜索|search|分析|analyze|文档|doc|readme", _goal_lower))
 
         if (_has_code_action and (_has_code_ext or _has_arch)) or _has_arch:
             configured_provider = "luban"
@@ -3570,7 +3568,23 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent, goal: Optional[str]
         elif _has_deploy or _has_ops:
             configured_provider = "mogong"
             logger.info("delegation route: deploy/ops/test -> provider='mogong'")
-        # else: stays as 'custom' = general-purpose leaf agent
+        # else: stays as None = general-purpose leaf agent
+
+    # v3 patch (2026-08-10): 当 delegation.provider == "custom" 时，
+    # 自动解析到 custom_providers 列表中的第一个条目（通常 name: wsl-v3）。
+    # 上游 rebase 会覆盖此补丁，每次升级后需重打。
+    if configured_provider == "custom" and not configured_base_url:
+        try:
+            from hermes_cli.config import load_config
+            _patch_cfg = load_config()
+            _cp_list = _patch_cfg.get("custom_providers") if isinstance(_patch_cfg, dict) else None
+            if isinstance(_cp_list, list) and len(_cp_list) > 0:
+                _first = _cp_list[0]
+                if isinstance(_first, dict) and _first.get("api_key"):
+                    configured_provider = _first.get("name", "wsl-v3")
+                    logger.info(f"delegation provider 'custom' -> resolved to '{configured_provider}' (custom_providers[0])")
+        except Exception as _patch_e:
+            logger.warning(f"custom->wsl-v3 patch failed: {_patch_e}")
 
     # Native-SDK providers (Bedrock, Vertex, Google GenAI) speak their own
     # wire protocol — they cannot be reached via OpenAI chat_completions against
@@ -3660,6 +3674,14 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent, goal: Optional[str]
             f"Set the appropriate environment variable or run 'hermes auth'."
         )
 
+    # For luban/mogong (external CLI subprocess providers), do NOT forward
+    # command/args as acp_command — that would route the child through
+    # CopilotACPClient (JSON-RPC), which is incompatible with both Claude's
+    # stream-json and Codex's exec JSONL protocols. Instead, keep the provider
+    # name as override_provider so run_agent.py → resolve_provider_client
+    # selects the correct ClaudeStreamJsonClient / CodexStreamJsonClient.
+    _is_cli_subprocess_provider = configured_provider in ("luban", "mogong")
+
     return {
         "model": configured_model or runtime.get("model") or None,
         "provider": configured_provider if runtime.get("provider") == _RUNTIME_PROVIDER_CUSTOM else runtime.get("provider"),
@@ -3668,8 +3690,8 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent, goal: Optional[str]
         "api_mode": runtime.get("api_mode"),
         "request_overrides": dict(runtime.get("request_overrides") or {}),
         "max_output_tokens": runtime.get("max_output_tokens"),
-        "command": runtime.get("command"),
-        "args": list(runtime.get("args") or []),
+        "command": None if _is_cli_subprocess_provider else runtime.get("command"),
+        "args": [] if _is_cli_subprocess_provider else list(runtime.get("args") or []),
     }
 
 

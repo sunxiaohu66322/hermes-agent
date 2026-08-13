@@ -37,6 +37,9 @@ from agent.memory_provider import MemoryProvider
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from tools.registry import tool_error
 
+# BurstBuffer is an optional import-time dependency for batched turn
+# persistence; imported lazily inside MemoryManager so a problem there can
+# never break the default (buffer-disabled) path.
 logger = logging.getLogger(__name__)
 
 # How long shutdown_all() waits for in-flight background sync/prefetch work
@@ -398,6 +401,41 @@ class MemoryManager:
             "abandoned_prefetches": 0,
             "active_tasks": 0,
         }
+        # Optional BurstBuffer for batching per-turn sync_turn calls.
+        # None when disabled (default) — the sync_all path then behaves
+        # exactly as before. configure() wires it up from memory config.
+        self._burst_buffer: Optional[Any] = None
+
+    def configure_burst_buffer(self, mem_config: Optional[Dict[str, Any]]) -> None:
+        """Enable BurstBuffer from ``memory.burst_buffer`` config (or env).
+
+        No-op (buffer stays None) when disabled — the default. Call once
+        during agent init, before any sync_all. Safe to call again to
+        reconfigure: a previously-armed buffer is flushed first.
+        """
+        from agent.burst_buffer import (
+            BurstBuffer,
+            burst_buffer_params,
+            is_burst_buffer_enabled,
+        )
+
+        if self._burst_buffer is not None:
+            self._burst_buffer.flush_all()
+            self._burst_buffer = None
+
+        if not is_burst_buffer_enabled(mem_config):
+            return
+
+        params = burst_buffer_params(mem_config)
+        self._burst_buffer = BurstBuffer(
+            flush_fn=self._flush_burst,
+            **params,
+        )
+        logger.info(
+            "BurstBuffer enabled (quiet_ms=%s, max_turns=%s)",
+            self._burst_buffer.quiet_ms,
+            self._burst_buffer.max_turns,
+        )
 
     # -- Registration --------------------------------------------------------
 
@@ -669,6 +707,19 @@ class MemoryManager:
             return
         user_content = clean_user_content
 
+        # BurstBuffer path: hand the turn to the buffer instead of syncing
+        # now. Flush (idle-timeout or batch-full) later calls _flush_burst,
+        # which submits the same _run logic per turn through the serialized
+        # worker. Disabled (None) → original immediate-sync path below.
+        if self._burst_buffer is not None:
+            self._burst_buffer.add(
+                session_id,
+                user_content,
+                assistant_content,
+                messages=messages,
+            )
+            return
+
         def _run() -> None:
             for provider in providers:
                 try:
@@ -692,6 +743,69 @@ class MemoryManager:
                     )
 
         self._submit_background(_run)
+
+    def _sync_turns_to_providers(self, turns: List[Any], session_id: str) -> None:
+        """Forward buffered turns to every provider's sync_turn, in order.
+
+        Shared by the async flush (``_flush_burst``) and the synchronous
+        drain in ``on_session_end``. Runs the per-turn fan-out inline —
+        callers decide whether to wrap each turn in ``_submit_background``
+        (normal flush, preserves the single-worker FIFO) or run them
+        directly (session-end drain, where buffered turns MUST land before
+        the extraction that follows in the same call).
+        """
+        providers = list(self._providers)
+        if not providers or not turns:
+            return
+        for turn in turns:
+            user_content = turn.user_content
+            assistant_content = turn.assistant_content
+            turn_messages = turn.messages
+            turn_sid = turn.session_id or session_id
+            for provider in providers:
+                try:
+                    if turn_messages is not None and self._provider_sync_accepts_messages(provider):
+                        provider.sync_turn(
+                            user_content, assistant_content,
+                            session_id=turn_sid, messages=turn_messages,
+                        )
+                    else:
+                        provider.sync_turn(
+                            user_content, assistant_content, session_id=turn_sid,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "Memory provider '%s' sync_turn failed: %s",
+                        provider.name, e,
+                    )
+
+    def _flush_burst(self, session_id: str, actor_id: str, turns: List[Any]) -> None:
+        """BurstBuffer flush callback: replay buffered turns to providers.
+
+        Each turn is wrapped in its own ``_submit_background`` task so the
+        single-worker FIFO serializes them (turn N before turn N+1) and a
+        slow provider can't stall the turn path. This is the NORMAL flush
+        path, fired by idle-timeout and batch-full.
+
+        Session-end / shutdown drains do NOT use this — they call
+        ``_sync_turns_to_providers`` directly, because there the turns must
+        land synchronously before the extraction/teardown that follows in
+        the same call (re-entering ``_submit_background`` from inside the
+        worker would queue them AFTER the extraction — see on_session_end).
+        """
+        if not turns:
+            return
+
+        for turn in turns:
+            turn_sid = turn.session_id or session_id
+
+            def _run(
+                _turn=turn,
+                _sid=turn_sid,
+            ) -> None:
+                self._sync_turns_to_providers([_turn], _sid)
+
+            self._submit_background(_run)
 
     # -- Background dispatch -------------------------------------------------
 
@@ -864,6 +978,20 @@ class MemoryManager:
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Notify all providers of session end."""
+        # Drain any buffered turns SYNCHRONOUSLY so providers see the full
+        # session before running end-of-session extraction. This call may
+        # run on the caller's thread (CLI exit, /new via
+        # commit_memory_session, gateway shutdown), NOT the background worker
+        # — so the async flush_all() path would queue the turns behind the
+        # extraction on the worker and they'd land AFTER it. drain_pending
+        # pops the batches inline and replays them here, guaranteeing
+        # turn-sync completes before provider.on_session_end below.
+        if self._burst_buffer is not None:
+            try:
+                for sid, _actor, turns in self._burst_buffer.drain_pending():
+                    self._sync_turns_to_providers(turns, sid)
+            except Exception as e:
+                logger.warning("BurstBuffer drain at session end failed: %s", e)
         for provider in self._providers:
             try:
                 provider.on_session_end(messages)
@@ -1150,6 +1278,14 @@ class MemoryManager:
         daemon, so anything still wedged past the drain window dies with
         the interpreter rather than blocking exit.
         """
+        # Flush buffered turns before draining so they enter the same FIFO
+        # the drain waits on. Without this, turns still in the buffer would
+        # be lost when the executor is torn down.
+        if self._burst_buffer is not None:
+            try:
+                self._burst_buffer.flush_all()
+            except Exception as e:
+                logger.warning("BurstBuffer flush_all at shutdown failed: %s", e)
         self._drain_sync_executor()
         for provider in reversed(self._providers):
             try:
